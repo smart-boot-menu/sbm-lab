@@ -7,7 +7,7 @@ Automated QEMU (`x86_64` + `aarch64`), EDK2 OVMF/AAVMF, Das U-Boot `qemu_arm64`,
 ## Scope & Responsibilities
 
 - Reproducible Rust integration harness running `sbm-uefi`, `sbm-core`, `sbm-server`, `install`, and `sbm-agent` end-to-end across OVMF (standard + Secure Boot), AAVMF, and U-Boot `qemu_arm64`.
-- Native-speed ARM64 virtualization (`-accel hvf` on M5 Mac; `-accel kvm` on Linux CI) + TCG fallback.
+- Native-speed ARM64 virtualization (`-accel hvf` on an M-series Mac; `-accel kvm` on Linux CI) + TCG fallback. HVF is not assumed: the 2026-11-26 U-Boot probe passed under TCG after HVF aborted. Scenario: [scenarios/exp-as-ext01-phase1.md](scenarios/exp-as-ext01-phase1.md).
 - Golden QCOW2 disk fixtures (Windows/BitLocker, multi-Linux BLS/UKI, Apple-protected guardrails, corrupt GPT).
 - QMP `screendump` assertions, boot latency measurement harnesses, and power-cut/network/disk fault injection.
 
