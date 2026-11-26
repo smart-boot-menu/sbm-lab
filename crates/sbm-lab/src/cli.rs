@@ -1,13 +1,16 @@
 use crate::accel::AccelRequest;
+use crate::accel::Arch;
 use crate::artifacts::{fetch_release, scan};
 use crate::bench::{class_note, methodology_complete, summarize};
 use crate::error::{Error, Result};
 use crate::fixtures::fixture_ids;
 use crate::host::doctor;
+use crate::product::{find_core_uki, find_menu};
 use crate::profile::{
-    NetworkMode, ScenarioMode, Tier, find_profile, load_profiles, load_scenarios,
+    BootKind, NetworkMode, ScenarioMode, Tier, find_profile, load_profiles, load_scenarios,
 };
-use crate::run::{RunOptions, execute_run, scenario_passed};
+use crate::run::{RunOptions, ScenarioCheck, execute_run, probe_efi, scenario_passed};
+use crate::secureboot::enroll;
 use crate::util::{lab_root, sha256_file, which};
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -46,6 +49,9 @@ enum CommandKind {
         uboot: bool,
         #[arg(long)]
         build_vm: bool,
+        /// Enroll development Secure Boot keys and sign the lab probe.
+        #[arg(long)]
+        secure_boot: bool,
     },
     /// List profiles, fixtures, scenarios, artifacts, or runs.
     List {
@@ -102,6 +108,9 @@ enum CommandKind {
     Test {
         #[arg(long, default_value = "smoke")]
         tier: String,
+        /// Run one scenario id. The tier filter is not applied.
+        #[arg(long)]
+        id: Option<String>,
         #[arg(long)]
         efi: Option<PathBuf>,
         #[arg(long, default_value_t = 180)]
@@ -175,8 +184,9 @@ pub fn execute() -> Result<i32> {
             fixtures,
             uboot,
             build_vm,
+            secure_boot,
         } => {
-            let all = !probe && !fixtures && !uboot && !build_vm;
+            let all = !probe && !fixtures && !uboot && !build_vm && !secure_boot;
             if all || probe {
                 build_probe(&root)?;
             }
@@ -188,6 +198,9 @@ pub fn execute() -> Result<i32> {
             }
             if build_vm {
                 setup_build_vm(&root)?;
+            }
+            if secure_boot {
+                enroll(&root)?;
             }
             Ok(0)
         }
@@ -251,6 +264,11 @@ pub fn execute() -> Result<i32> {
         } => {
             let profiles = load_profiles(&root)?;
             let profile = find_profile(&profiles, &profile)?.clone();
+            let send_key_after = if profile.boot == BootKind::SbmMenu {
+                "menu_ready".into()
+            } else {
+                "waiting-for-key".into()
+            };
             let opts = RunOptions {
                 profile,
                 fixture,
@@ -276,6 +294,13 @@ pub fn execute() -> Result<i32> {
                 inject_probe: !no_probe,
                 artifacts_dir: None,
                 accel: AccelRequest::Auto,
+                boot: BootKind::Probe,
+                send_key_after,
+                stop_on_expect: false,
+                expect: Vec::new(),
+                stop_on_serial: Vec::new(),
+                require_files: Vec::new(),
+                reset_after: None,
             };
             let report = execute_run(&root, &opts)?;
             let code = if report.success { 0 } else { 1 };
@@ -286,7 +311,12 @@ pub fn execute() -> Result<i32> {
             )?;
             Ok(code)
         }
-        CommandKind::Test { tier, efi, timeout } => run_tier(&root, &tier, efi, timeout, cli.json),
+        CommandKind::Test {
+            tier,
+            id,
+            efi,
+            timeout,
+        } => run_tier(&root, &tier, id.as_deref(), efi, timeout, cli.json),
         CommandKind::Benchmark {
             profile,
             runs,
@@ -371,6 +401,7 @@ pub fn execute() -> Result<i32> {
 fn run_tier(
     root: &Path,
     tier: &str,
+    only: Option<&str>,
     efi: Option<PathBuf>,
     timeout: u64,
     json_out: bool,
@@ -379,19 +410,47 @@ fn run_tier(
         "smoke" => vec![Tier::Smoke],
         "full" => vec![Tier::Full],
         "fault" => vec![Tier::Fault],
+        "product" => vec![Tier::Product],
+        "secure" => vec![Tier::Secure],
+        "builder" => vec![Tier::Builder],
         "all" => vec![Tier::Smoke, Tier::Full, Tier::Fault],
         other => return Err(Error::message(format!("unknown tier {other}"))),
     };
     let scenarios = load_scenarios(root)?;
+    let profiles = load_profiles(root)?;
     let mut failed = 0;
     let mut results = Vec::new();
-    for scenario in scenarios.into_iter().filter(|s| want.contains(&s.tier)) {
+    let mut ran = false;
+    for scenario in scenarios.into_iter().filter(|scenario| {
+        if let Some(id) = only {
+            scenario.id == id
+        } else {
+            want.contains(&scenario.tier)
+        }
+    }) {
+        ran = true;
         if scenario.profile == "uboot-efi" && crate::firmware::uboot_binary(root).is_none() {
             results.push(json!({"id": scenario.id, "skipped": "u-boot binary missing"}));
             continue;
         }
         if scenario.profile.contains("tpm") && which("swtpm").is_none() {
             results.push(json!({"id": scenario.id, "skipped": "swtpm missing"}));
+            continue;
+        }
+        let profile = find_profile(&profiles, &scenario.profile)?.clone();
+        if scenario.use_core && find_core_uki(root, profile.arch).is_none() {
+            results.push(json!({"id": scenario.id, "skipped": "sbm-core UKI is not built"}));
+            continue;
+        }
+        if (scenario.boot == BootKind::SbmMenu || profile.boot == BootKind::SbmMenu)
+            && find_menu(root, profile.arch).is_err()
+        {
+            failed += 1;
+            results.push(json!({"id": scenario.id, "success": false, "reason": "SBM UEFI menu binary is missing"}));
+            continue;
+        }
+        if scenario.profile == "linux-dev" && crate::builder::find_build_image(root).is_err() {
+            results.push(json!({"id": scenario.id, "skipped": "build VM image is missing"}));
             continue;
         }
         match run_scenario(root, &scenario, efi.clone(), timeout) {
@@ -408,6 +467,12 @@ fn run_tier(
                     .push(json!({"id": scenario.id, "success": false, "reason": err.to_string()}));
             }
         }
+    }
+    if !ran {
+        return Err(Error::message(match only {
+            Some(id) => format!("unknown scenario {id}"),
+            None => format!("no scenarios in tier {tier}"),
+        }));
     }
     emit(json_out, &results, &serde_json::to_string_pretty(&results)?)?;
     Ok(if failed == 0 { 0 } else { 1 })
@@ -459,6 +524,22 @@ fn run_scenario(
     opts.inject_probe = scenario.inject_probe;
     opts.memory_mib = scenario.memory_mib;
     opts.network = scenario.network;
+    opts.boot = scenario.boot;
+    opts.send_key_after = scenario
+        .send_key_after
+        .clone()
+        .unwrap_or_else(|| "waiting-for-key".into());
+    opts.stop_on_expect = scenario.stop_on_expect;
+    opts.expect = scenario.expect.clone();
+    opts.stop_on_serial = scenario.stop_on_serial.clone();
+    opts.require_files = scenario.require_files.clone();
+    opts.reset_after = scenario.reset_after.clone();
+    if scenario.use_core {
+        opts.core = find_core_uki(root, opts.profile.arch);
+    }
+    if let Some(variant) = &scenario.efi_variant {
+        opts.efi = Some(secure_efi(root, variant)?);
+    }
     opts.keep_failed = true;
     let report = execute_run(root, &opts)?;
     let mode = match scenario.mode {
@@ -474,16 +555,25 @@ fn run_scenario(
     };
     if let Err(err) = scenario_passed(
         &report,
-        &scenario.expect,
-        &scenario.require_paths,
-        &scenario.forbid_paths,
-        &scenario.serial_contains,
-        mode,
-        shot,
+        &ScenarioCheck {
+            expect: &scenario.expect,
+            require: &scenario.require_paths,
+            forbid: &scenario.forbid_paths,
+            serial_contains: &scenario.serial_contains,
+            mode,
+            screenshot: shot,
+            forbid_markers: &scenario.forbid_markers,
+            serial_contains_any: &scenario.serial_contains_any,
+            reset_after: scenario.reset_after.as_deref(),
+        },
     ) {
         let mut failed = report;
+        let previous = failed.failure_reason.clone();
         failed.success = false;
-        failed.failure_reason = Some(err.to_string());
+        failed.failure_reason = Some(match previous {
+            Some(previous) if !previous.is_empty() => format!("{previous}; {err}"),
+            _ => err.to_string(),
+        });
         return Ok(failed);
     }
     Ok(report)
@@ -515,7 +605,32 @@ fn base_opts(profile: crate::profile::Profile, timeout: u64) -> RunOptions {
         inject_probe: true,
         artifacts_dir: None,
         accel: AccelRequest::Auto,
+        boot: BootKind::Probe,
+        send_key_after: "waiting-for-key".into(),
+        stop_on_expect: false,
+        expect: Vec::new(),
+        stop_on_serial: Vec::new(),
+        require_files: Vec::new(),
+        reset_after: None,
     }
+}
+
+fn secure_efi(root: &Path, variant: &str) -> Result<PathBuf> {
+    let path = match variant {
+        "signed" => root.join("var/secure-boot/probe-signed.efi"),
+        "tampered" => root.join("var/secure-boot/probe-tampered.efi"),
+        "unsigned" => probe_efi(root, Arch::X86_64).ok_or_else(|| {
+            Error::message("x86_64 probe EFI is missing; run sbm-lab setup --probe")
+        })?,
+        other => return Err(Error::message(format!("unknown efi variant {other}"))),
+    };
+    if !path.is_file() {
+        return Err(Error::message(format!(
+            "{} is missing; run sbm-lab setup --secure-boot",
+            path.display()
+        )));
+    }
+    Ok(path)
 }
 
 fn benchmark(

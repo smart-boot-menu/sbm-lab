@@ -1,4 +1,5 @@
-use crate::accel::{AccelRequest, Arch, HostFacts, select_accel};
+use crate::accel::{AccelRequest, Arch, HostFacts, effective_timeout, select_accel};
+use crate::builder::{cloud_seed, find_build_image, image_format};
 use crate::error::{Error, Result};
 use crate::fatimg::{build_fat32, read_fat_file};
 use crate::firmware::{copy_vars, select_firmware, uboot_binary};
@@ -6,11 +7,14 @@ use crate::fixtures::build_fixture;
 use crate::gpt::{PartitionSpec, SECTOR, build_gpt, esp_guid, validate_gpt};
 use crate::host::host_facts;
 use crate::launch::{AttachedDisk, LaunchPlan, NetworkAttach, qemu_args};
-use crate::markers::{boot_target_paths, firmware_banner, parse_markers};
-use crate::profile::{NetworkMode, Profile, Role};
+use crate::markers::{boot_target_paths, firmware_banner, log_tail, parse_markers};
+use crate::product::build_menu_disk;
+use crate::profile::{BootKind, NetworkMode, Profile, Role};
 use crate::proxy::DelayProxy;
 use crate::qmp::Qmp;
-use crate::util::{env_u32, reject_host_device, sha256_file, short_id, which, write_file};
+use crate::util::{
+    FileLock, env_u32, pe_machine, reject_host_device, sha256_file, short_id, which, write_file,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -45,6 +49,13 @@ pub struct RunOptions {
     pub inject_probe: bool,
     pub artifacts_dir: Option<PathBuf>,
     pub accel: AccelRequest,
+    pub boot: BootKind,
+    pub send_key_after: String,
+    pub stop_on_expect: bool,
+    pub expect: Vec<String>,
+    pub stop_on_serial: Vec<String>,
+    pub require_files: Vec<String>,
+    pub reset_after: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +90,8 @@ pub struct RunReport {
     pub safety: SafetyReport,
     pub kept: bool,
     pub run_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_class: Option<String>,
 }
 
 struct Slot(PathBuf);
@@ -89,11 +102,6 @@ impl Drop for Slot {
 }
 
 pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
-    if opts.profile.role == Role::BuildVm {
-        return Err(Error::message(
-            "linux-dev build VMs are started with `sbm-lab run linux-dev` after `sbm-lab setup --build-vm`",
-        ));
-    }
     let _slot = acquire_slot(root)?;
     let id = short_id();
     let run_dir = root.join("var/runs").join(&id);
@@ -148,7 +156,19 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
             secure,
             &machine_key(&opts.profile.machine, arch),
         )?;
-        (Some(fw.code), Some(fw.vars_template), fw.requires_smm, None)
+        let vars = if let Some(rel) = &opts.profile.vars_template {
+            let path = root.join(rel);
+            if !path.is_file() {
+                return Err(Error::message(format!(
+                    "variable template {} is missing; run sbm-lab setup --secure-boot",
+                    path.display()
+                )));
+            }
+            path
+        } else {
+            fw.vars_template
+        };
+        (Some(fw.code), Some(vars), fw.requires_smm, None)
     };
     let code_hash = code.as_ref().map(|p| sha256_file(p)).transpose()?;
     let vars_hash = vars_template.as_ref().map(|p| sha256_file(p)).transpose()?;
@@ -165,8 +185,59 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
     let mut backing_hashes = Vec::new();
     let mut disks = Vec::new();
     let mut usb_disks = Vec::new();
-    if opts.inject_probe && opts.profile.id != "legacy-bios" && opts.profile.id != "ia32-uefi" {
-        let probe = build_probe_disk(root, &run_dir, arch, opts)?;
+    let mut payload_class = None;
+    let boot = if opts.boot == BootKind::Probe {
+        opts.profile.boot
+    } else {
+        opts.boot
+    };
+    if opts.profile.role == Role::BuildVm {
+        let image = find_build_image(root)?;
+        reject_host_device(&image)?;
+        let hash = sha256_file(&image)?;
+        backing_hashes.push((image.clone(), hash));
+        let overlay = run_dir.join("build-vm.qcow2");
+        qemu_img_overlay(&image, &overlay, &image_format(&image)?)?;
+        disks.push(AttachedDisk {
+            id: "root".into(),
+            path: overlay,
+            format: "qcow2".into(),
+            bootindex: 0,
+            blkdebug: None,
+        });
+        let seed = run_dir.join("cidata.raw");
+        fs::write(&seed, cloud_seed()?)?;
+        disks.push(AttachedDisk {
+            id: "cidata".into(),
+            path: seed,
+            format: "raw".into(),
+            bootindex: 1,
+            blkdebug: None,
+        });
+    } else if opts.inject_probe
+        && opts.profile.id != "legacy-bios"
+        && opts.profile.id != "ia32-uefi"
+    {
+        let probe = if boot == BootKind::SbmMenu {
+            let built = build_menu_disk(root, arch, opts.core.as_deref())?;
+            payload_class = Some(built.payload_class);
+            let path = run_dir.join("probe.raw");
+            fs::write(&path, built.bytes)?;
+            if opts.core.is_some() {
+                let scratch = run_dir.join("scratch.raw");
+                File::create(&scratch)?.set_len(64 * 1024 * 1024)?;
+                disks.push(AttachedDisk {
+                    id: "scratch".into(),
+                    path: scratch,
+                    format: "raw".into(),
+                    bootindex: 2,
+                    blkdebug: None,
+                });
+            }
+            path
+        } else {
+            build_probe_disk(root, &run_dir, arch, opts)?
+        };
         disks.push(AttachedDisk {
             id: "probe".into(),
             path: probe,
@@ -185,7 +256,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
         let hash = sha256_file(&backing)?;
         backing_hashes.push((backing.clone(), hash));
         let overlay = run_dir.join(format!("overlay-{index}.qcow2"));
-        qemu_img_overlay(&backing, &overlay)?;
+        qemu_img_overlay(&backing, &overlay, "qcow2")?;
         let format = "qcow2".to_string();
         let blkdebug = if opts.io_error {
             let cfg = run_dir.join(format!("blkdebug-{index}.cfg"));
@@ -282,6 +353,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
         qmp_socket: qmp_socket.clone(),
         debugcon: debugcon.clone(),
         graphical: opts.graphical,
+        allow_reboot: opts.reset_after.is_some(),
     };
     let argv = qemu_args(&plan)?;
     fs::write(run_dir.join("qemu.argv"), argv.join("\n"))?;
@@ -307,6 +379,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
         .spawn()?;
     let started = Instant::now();
     let mut failure = None;
+    let timeout_secs = effective_timeout(&facts.arch, arch, opts.timeout_secs);
     let observed = match observe(
         &mut child,
         &run_dir,
@@ -314,6 +387,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
         &qmp_socket,
         opts,
         started,
+        timeout_secs,
     ) {
         Ok(value) => value,
         Err(err) => {
@@ -400,12 +474,28 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
     }
     if failure.is_none()
         && opts.inject_probe
+        && opts.profile.role != Role::BuildVm
+        && boot == BootKind::Probe
         && opts.profile.id != "legacy-bios"
         && opts.profile.id != "ia32-uefi"
         && !markers.iter().any(|marker| marker.name == "efi-launched")
         && banner.is_none()
     {
         failure = Some("guest did not emit efi-launched".into());
+    }
+    if failure.is_none()
+        && opts.profile.role == Role::BuildVm
+        && !markers.iter().any(|marker| marker.name == "build-vm-ready")
+    {
+        failure = Some("build VM did not emit build-vm-ready".into());
+    }
+    if failure.is_none() && probe_raw.is_file() {
+        for path in &opts.require_files {
+            if read_probe_file(&probe_raw, path).is_err() {
+                failure = Some(format!("boot disk is missing {path}"));
+                break;
+            }
+        }
     }
     let shot = run_dir.join("screenshot.ppm");
     let screenshot = shot.is_file().then(|| shot.display().to_string());
@@ -443,6 +533,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
         safety,
         kept,
         run_dir: run_dir.display().to_string(),
+        payload_class,
     };
     write_file(
         &run_dir.join("result.json"),
@@ -489,8 +580,9 @@ fn observe(
     qmp_socket: &Path,
     opts: &RunOptions,
     started: Instant,
+    timeout_secs: u64,
 ) -> Result<Observed> {
-    let deadline = started + Duration::from_secs(opts.timeout_secs.max(1));
+    let deadline = started + Duration::from_secs(timeout_secs.max(1));
     let mut serial = open_serial(serial_socket, deadline)?;
     let mut qmp = connect_qmp(qmp_socket, deadline).ok();
     let mut buf = String::new();
@@ -498,7 +590,13 @@ fn observe(
     let mut shot = false;
     let mut keyed = false;
     let mut dropped = false;
+    let mut reset = false;
     let mut exit_code = None;
+    let mut expect = opts.expect.clone();
+    if opts.profile.role == Role::BuildVm && !expect.iter().any(|name| name == "build-vm-ready") {
+        expect.push("build-vm-ready".into());
+    }
+    let stop_when_expected = opts.stop_on_expect || opts.profile.role == Role::BuildVm;
     loop {
         if Instant::now() > deadline {
             let _ = child.kill();
@@ -533,7 +631,14 @@ fn observe(
                 .or_insert_with(|| started.elapsed().as_millis() as u64);
         }
         let names: Vec<&str> = markers.iter().map(|m| m.name.as_str()).collect();
-        if names.contains(&"gop-ready")
+        let key_after = if opts.send_key_after.is_empty() {
+            "waiting-for-key"
+        } else {
+            opts.send_key_after.as_str()
+        };
+        if (names.contains(&"gop-ready")
+            || names.contains(&"menu_ready")
+            || names.contains(&"first_frame"))
             && !shot
             && let Some(qmp) = qmp.as_mut()
         {
@@ -541,7 +646,7 @@ fn observe(
             let _ = qmp.screendump(&path);
             shot = path.is_file();
         }
-        if names.contains(&"waiting-for-key")
+        if names.contains(&key_after)
             && !keyed
             && let Some(key) = &opts.send_key
             && let Some(qmp) = qmp.as_mut()
@@ -563,6 +668,45 @@ fn observe(
             break;
         }
         if names.contains(&"halt") && !opts.journal {
+            std::thread::sleep(Duration::from_millis(200));
+            if let Some(qmp) = qmp.as_mut() {
+                let _ = qmp.quit();
+            }
+            let _ = child.wait();
+            break;
+        }
+        if let Some(after) = &opts.reset_after
+            && !reset
+            && names.contains(&after.as_str())
+            && let Some(qmp) = qmp.as_mut()
+        {
+            let _ = qmp.system_reset();
+            reset = true;
+        }
+        if opts
+            .stop_on_serial
+            .iter()
+            .any(|needle| buf.contains(needle))
+        {
+            std::thread::sleep(Duration::from_millis(200));
+            if let Some(qmp) = qmp.as_mut() {
+                let _ = qmp.quit();
+            }
+            let _ = child.wait();
+            break;
+        }
+        let ready = !expect.is_empty()
+            && expect.iter().all(|name| {
+                markers
+                    .iter()
+                    .any(|marker| marker.name == *name || marker.raw.starts_with(name))
+            });
+        let menu_ready_count = markers
+            .iter()
+            .filter(|marker| marker.name == "menu_ready")
+            .count();
+        let reset_satisfied = opts.reset_after.is_none() || (reset && menu_ready_count >= 2);
+        if stop_when_expected && ready && reset_satisfied {
             std::thread::sleep(Duration::from_millis(200));
             if let Some(qmp) = qmp.as_mut() {
                 let _ = qmp.quit();
@@ -634,8 +778,11 @@ fn build_probe_disk(root: &Path, run_dir: &Path, arch: Arch, opts: &RunOptions) 
             )));
         }
     }
+    let boot_efi = boot_name.rsplit('/').next().unwrap_or("BOOTX64.EFI");
+    let nsh = format!("echo -off\r\nfs0:\\EFI\\BOOT\\{boot_efi}\r\n");
     let mut files: Vec<(String, Vec<u8>)> = vec![
         (boot_name.into(), efi_bytes),
+        ("startup.nsh".into(), nsh.into_bytes()),
         ("EFI/sbm-lab/role.txt".into(), b"probe\n".to_vec()),
     ];
     if opts.chainload
@@ -685,17 +832,6 @@ fn build_probe_disk(root: &Path, run_dir: &Path, arch: Arch, opts: &RunOptions) 
     Ok(path)
 }
 
-pub fn pe_machine(bytes: &[u8]) -> Option<u16> {
-    if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
-        return None;
-    }
-    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().ok()?) as usize;
-    if bytes.len() < pe + 6 || &bytes[pe..pe + 4] != b"PE\0\0" {
-        return None;
-    }
-    Some(u16::from_le_bytes(bytes[pe + 4..pe + 6].try_into().ok()?))
-}
-
 pub fn probe_efi(root: &Path, arch: Arch) -> Option<PathBuf> {
     let target = match arch {
         Arch::X86_64 => "x86_64-unknown-uefi",
@@ -739,6 +875,7 @@ fn read_probe_file(image: &Path, fat_path: &str) -> Result<Vec<u8>> {
 pub fn ensure_fixture(root: &Path, id: &str) -> Result<PathBuf> {
     let dir = root.join("var/fixtures");
     fs::create_dir_all(&dir)?;
+    let _lock = FileLock::exclusive(&dir.join(".lock"))?;
     let qcow = dir.join(format!("{id}.qcow2"));
     if qcow.is_file() {
         return Ok(qcow);
@@ -769,14 +906,14 @@ fn qemu_img_convert(raw: &Path, qcow: &Path) -> Result<()> {
     Ok(())
 }
 
-fn qemu_img_overlay(backing: &Path, overlay: &Path) -> Result<()> {
+fn qemu_img_overlay(backing: &Path, overlay: &Path, format: &str) -> Result<()> {
     reject_host_device(backing)?;
     let bin = which("qemu-img").ok_or_else(|| Error::message("qemu-img is not installed"))?;
     let backing = fs::canonicalize(backing)?;
     let status = Command::new(bin)
         .args(["create", "-f", "qcow2", "-b"])
         .arg(&backing)
-        .args(["-F", "qcow2"])
+        .args(["-F", format])
         .arg(overlay)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -902,15 +1039,31 @@ fn pid_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-pub fn scenario_passed(
-    report: &RunReport,
-    expect: &[String],
-    require: &[String],
-    forbid: &[String],
-    serial_contains: &[String],
-    mode: &str,
-    screenshot: &str,
-) -> Result<()> {
+#[derive(Clone, Copy)]
+pub struct ScenarioCheck<'a> {
+    pub expect: &'a [String],
+    pub require: &'a [String],
+    pub forbid: &'a [String],
+    pub serial_contains: &'a [String],
+    pub mode: &'a str,
+    pub screenshot: &'a str,
+    pub forbid_markers: &'a [String],
+    pub serial_contains_any: &'a [String],
+    pub reset_after: Option<&'a str>,
+}
+
+pub fn scenario_passed(report: &RunReport, check: &ScenarioCheck<'_>) -> Result<()> {
+    let ScenarioCheck {
+        expect,
+        require,
+        forbid,
+        serial_contains,
+        mode,
+        screenshot,
+        forbid_markers,
+        serial_contains_any,
+        reset_after,
+    } = *check;
     if !report.safety.backing_hashes_unchanged
         || !report.safety.firmware_template_unchanged
         || report.safety.physical_disks_passed_through
@@ -934,8 +1087,52 @@ pub fn scenario_passed(
     }
     for name in expect {
         if !report.markers.iter().any(|m| m.starts_with(name)) {
-            return Err(Error::message(format!("missing marker {name}")));
+            return Err(Error::message(format!(
+                "missing marker {name}\n{}",
+                evidence(report)
+            )));
         }
+    }
+    for name in forbid_markers {
+        if report.markers.iter().any(|m| m.starts_with(name)) {
+            return Err(Error::message(format!(
+                "forbidden marker {name} was present\n{}",
+                evidence(report)
+            )));
+        }
+    }
+    if reset_after.is_some() {
+        let ready = report
+            .markers
+            .iter()
+            .filter(|marker| marker.starts_with("menu_ready"))
+            .count();
+        if ready < 2 {
+            return Err(Error::message(format!(
+                "reset did not return to the menu\n{}",
+                evidence(report)
+            )));
+        }
+    }
+    let serial = fs::read_to_string(&report.serial_log).unwrap_or_default();
+    for needle in serial_contains {
+        if !serial.contains(needle) {
+            return Err(Error::message(format!(
+                "serial missing {needle}\n{}",
+                evidence(report)
+            )));
+        }
+    }
+    if !serial_contains_any.is_empty()
+        && !serial_contains_any
+            .iter()
+            .any(|needle| serial.contains(needle))
+    {
+        return Err(Error::message(format!(
+            "serial missing any of {}\n{}",
+            serial_contains_any.join(", "),
+            evidence(report)
+        )));
     }
     let joined = report.boot_targets.join("\n") + &report.markers.join("\n");
     for needle in require {
@@ -977,4 +1174,15 @@ pub fn scenario_passed(
         }
     }
     Ok(())
+}
+
+fn evidence(report: &RunReport) -> String {
+    let serial = fs::read_to_string(&report.serial_log).unwrap_or_default();
+    let stderr =
+        fs::read_to_string(Path::new(&report.run_dir).join("qemu.stderr")).unwrap_or_default();
+    format!(
+        "serial:\n{}\nqemu.stderr:\n{}",
+        log_tail(&serial, 12),
+        log_tail(&stderr, 8)
+    )
 }

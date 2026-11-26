@@ -36,6 +36,7 @@ pub struct LaunchPlan {
     pub qmp_socket: PathBuf,
     pub debugcon: Option<PathBuf>,
     pub graphical: bool,
+    pub allow_reboot: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +82,9 @@ pub fn qemu_args(plan: &LaunchPlan) -> Result<Vec<String>> {
         "none".into()
     });
     args.push("-nodefaults".into());
-    args.push("-no-reboot".into());
+    if !plan.allow_reboot {
+        args.push("-no-reboot".into());
+    }
     match (plan.arch, plan.gpu) {
         (Arch::X86_64 | Arch::Ia32, GpuKind::Virtio) => {
             args.push("-vga".into());
@@ -259,6 +262,7 @@ mod tests {
             qmp_socket: PathBuf::from("/tmp/qmp.sock"),
             debugcon: None,
             graphical: false,
+            allow_reboot: false,
         }
     }
 

@@ -69,6 +69,11 @@ impl Qmp {
         Ok(())
     }
 
+    pub fn system_reset(&mut self) -> Result<()> {
+        self.execute("system_reset", None)?;
+        Ok(())
+    }
+
     fn read_message(&mut self) -> Result<Value> {
         let mut buf = Vec::new();
         let mut byte = [0u8; 1];

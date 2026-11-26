@@ -15,6 +15,8 @@ pub fn scan(root: &Path) -> Vec<Artifact> {
     let mut dirs = vec![
         root.join("var/artifacts"),
         root.join("var/artifacts/pinned"),
+        root.join("../sbm-uefi/artifacts"),
+        root.join("sbm-uefi-src/artifacts"),
         root.join("../sbm-uefi/target/x86_64-unknown-uefi/release"),
         root.join("../sbm-uefi/target/aarch64-unknown-uefi/release"),
         root.join("../sbm-uefi/target/x86_64-unknown-uefi/debug"),

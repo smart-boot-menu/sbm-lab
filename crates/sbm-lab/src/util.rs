@@ -1,7 +1,8 @@
 use crate::error::{Error, Result};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -63,6 +64,49 @@ pub fn tool_version(bin: &Path) -> Option<String> {
         None
     } else {
         Some(line.to_string())
+    }
+}
+
+pub fn pe_machine(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 0x40 || &bytes[0..2] != b"MZ" {
+        return None;
+    }
+    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().ok()?) as usize;
+    if bytes.len() < pe + 6 || &bytes[pe..pe + 4] != b"PE\0\0" {
+        return None;
+    }
+    Some(u16::from_le_bytes(bytes[pe + 4..pe + 6].try_into().ok()?))
+}
+
+/// Exclusive lock so two agents sharing one checkout cannot rebuild the same
+/// fixture or key directory at the same time. Drop releases the lock.
+pub struct FileLock {
+    file: File,
+}
+
+impl FileLock {
+    pub fn exclusive(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(Error::message(format!("could not lock {}", path.display())));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 }
 

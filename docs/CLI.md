@@ -20,9 +20,10 @@ sbm-lab setup --probe
 sbm-lab setup --fixtures
 sbm-lab setup --uboot
 sbm-lab setup --build-vm
+sbm-lab setup --secure-boot
 ```
 
-`--probe` cross-compiles `fixtures/efi-probe` for `x86_64-unknown-uefi` and `aarch64-unknown-uefi`. `--fixtures` writes `var/fixtures/<id>.qcow2`. `--uboot` downloads the tarball pinned in `firmware/sources.toml`, checks its SHA-256, and builds `var/firmware/u-boot-qemu-arm64.bin` with GNU make. On macOS the host compiler is passed as `HOSTCC=clang -I<openssl>/include` because the U-Boot makefile overrides an environment `HOSTCC`. `--build-vm` downloads the Ubuntu noble cloud image named in `firmware/sources.toml` and checks it against `SHA256SUMS`. The image stays in `var/build-vm`.
+`--probe` cross-compiles `fixtures/efi-probe` for `x86_64-unknown-uefi` and `aarch64-unknown-uefi`. `--fixtures` writes `var/fixtures/<id>.qcow2`. `--uboot` downloads the tarball pinned in `firmware/sources.toml`, checks its SHA-256, and builds `var/firmware/u-boot-qemu-arm64.bin` with GNU make. On macOS the host compiler is passed as `HOSTCC=clang -I<openssl>/include` because the U-Boot makefile overrides an environment `HOSTCC`. `--build-vm` downloads the Ubuntu noble cloud image named in `firmware/sources.toml` and checks it against `SHA256SUMS`. The image stays in `var/build-vm`. `--secure-boot` writes development PK, KEK, and db keys under `var/secure-boot`, enrolls them into a copy of the OVMF variable template, and signs the x86_64 probe with `osslsigncode`. Those keys are not production keys.
 
 ## list
 
@@ -52,7 +53,7 @@ sbm-lab run <profile> [options]
 | `--keep-failed` | Keep them after failure. |
 | `--memory MIB` / `--cpus N` | Clamped by `SBM_LAB_MAX_MEMORY_MIB` (8192) and `SBM_LAB_MAX_CPUS` (4). |
 | `--screenshot PATH` | Copy the QMP PPM here. |
-| `--key QCODE` | After the probe prints `waiting-for-key`, inject this QEMU key. `ret` is Return. |
+| `--key QCODE` | Inject this QEMU key. The probe waits for `waiting-for-key`. An SBM menu profile waits for `menu_ready`. `ret` is Return and `c` is the recovery key. |
 | `--chainload` | Place the lab payload on the probe disk and ask the probe to start it. |
 | `--no-probe` | Do not build the probe disk. |
 
@@ -75,11 +76,15 @@ The report schema is `sbm-lab.run.v1`. Fields agents can rely on:
 sbm-lab test --tier smoke
 sbm-lab test --tier full
 sbm-lab test --tier fault
+sbm-lab test --tier product
+sbm-lab test --tier secure
+sbm-lab test --tier builder
 sbm-lab test --tier all
+sbm-lab test --id sbm-uefi-menu-x86_64
 sbm-lab test --tier smoke --efi path/to/app.efi
 ```
 
-`smoke` is the default. A scenario that needs U-Boot or swtpm is skipped, not failed, when that tool is absent. See [TESTING.md](TESTING.md).
+`smoke` is the default. `--id` runs that scenario and does not apply the tier filter. A scenario that needs U-Boot, swtpm, a build-VM image, or an SBM Core UKI is skipped, not failed, when that input is absent. A missing SBM UEFI menu binary fails the product scenario. See [TESTING.md](TESTING.md).
 
 ## benchmark
 

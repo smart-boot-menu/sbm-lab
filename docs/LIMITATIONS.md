@@ -11,10 +11,9 @@ Verified on the Apple M5 dev Mac with QEMU 11.1.3 on 2026-11-26:
 
 Partial, and labeled that way in the scenarios:
 
-- Secure Boot firmware comes up without enrolled keys. An unsigned probe can still launch. The lab does not claim enforcement.
+- `x86_64-uefi-secure-boot` still boots the firmware's own variable template, which is not key-enrolled. Enforcement is the separate `x86_64-secure-enrolled` profile, created by `sbm-lab setup --secure-boot`. Those keys are development keys.
 - There is no `i686-unknown-uefi` probe. IA32 tests stop at the firmware shell unless the caller passes a PE whose machine is `0x14C`.
 - Legacy BIOS expects a SeaBIOS banner and does not run the UEFI probe.
 - NTFS, Btrfs, and LUKS1 fixtures are synthetic headers. LUKS is not unlockable. There is no Windows image and no Apple disk image.
-- `setup --build-vm` downloads and hashes the Ubuntu noble cloud image. `run linux-dev` does not boot that image yet.
-- SBM UEFI and SBM Core images are picked up with `--efi`, `--core`, or `artifacts scan` when those builds exist. The smoke tier uses the lab probe when they do not.
-- Recovery of a full Linux guest is not part of this harness. The chainload check starts the lab payload.
+- `setup --build-vm` downloads and hashes the Ubuntu noble cloud image. `run linux-dev` and `test --id linux-dev-ready` boot an overlay of that image, or of the Fedora cloud qcow2 already built under `sbm-core`, and wait for `build-vm-ready`. The lab does not run mkosi.
+- The smoke tier uses the lab probe. `test --tier product` boots `../sbm-uefi/artifacts/sbm-*.efi`. Without an SBM Core UKI the recovery payload is the SBM fixture EFI, and the Core scenarios are skipped. A skip is not a boot of Linux, the management shell, or GParted.

@@ -1,0 +1,30 @@
+[[scenario]]
+id = "secure-signed-probe"
+description = "The lab probe signed by the development db key launches under enrolled Secure Boot."
+tier = "secure"
+profile = "x86_64-secure-enrolled"
+efi_variant = "signed"
+timeout_secs = 180
+expect = ["efi-launched", "halt"]
+
+[[scenario]]
+id = "secure-unsigned-rejected"
+description = "An unsigned probe must not launch. This is separate from the ordinary boot test."
+tier = "secure"
+profile = "x86_64-secure-enrolled"
+efi_variant = "unsigned"
+timeout_secs = 120
+forbid_markers = ["efi-launched"]
+serial_contains_any = ["Access Denied", "Security Violation"]
+stop_on_serial = ["Access Denied", "Security Violation"]
+
+[[scenario]]
+id = "secure-tampered-rejected"
+description = "A signed probe with one byte flipped after signing must not launch."
+tier = "secure"
+profile = "x86_64-secure-enrolled"
+efi_variant = "tampered"
+timeout_secs = 120
+forbid_markers = ["efi-launched"]
+serial_contains_any = ["Access Denied", "Security Violation"]
+stop_on_serial = ["Access Denied", "Security Violation"]

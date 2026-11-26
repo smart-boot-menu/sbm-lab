@@ -1,0 +1,9 @@
+id = "sbm-uefi-aarch64"
+description = "Actual SBM UEFI menu on AAVMF. OS-looking paths are the SBM fixture EFI, not Windows or Linux."
+arch = "aarch64"
+machine = "virt"
+memory_mib = 1024
+cpus = 2
+network = "none"
+boot = "sbm-menu"
+notes = "Requires ../sbm-uefi/artifacts/sbm-aarch64.efi and sbm-fixture-aarch64.efi."

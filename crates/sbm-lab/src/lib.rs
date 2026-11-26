@@ -1,6 +1,7 @@
 pub mod accel;
 pub mod artifacts;
 pub mod bench;
+pub mod builder;
 pub mod cli;
 pub mod error;
 pub mod fatimg;
@@ -10,8 +11,10 @@ pub mod gpt;
 pub mod host;
 pub mod launch;
 pub mod markers;
+pub mod product;
 pub mod profile;
 pub mod proxy;
 pub mod qmp;
 pub mod run;
+pub mod secureboot;
 pub mod util;

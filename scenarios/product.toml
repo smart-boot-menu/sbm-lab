@@ -1,0 +1,84 @@
+[[scenario]]
+id = "sbm-uefi-menu-x86_64"
+description = "Boot the real SBM menu, capture the GOP frame, press C for recovery, and reset back to the menu. The recovery payload is the labeled SBM fixture, not a Linux distribution."
+tier = "product"
+profile = "sbm-uefi-x86_64"
+timeout_secs = 180
+send_key = "c"
+send_key_after = "menu_ready"
+stop_on_expect = true
+reset_after = "chainload_returned"
+screenshot = "qmp"
+expect = ["menu_ready", "key c", "fixture_started", "chainload_returned", "target SBM Core Slot A"]
+require_files = ["EFI/sbm/handoff/current.json", "EFI/sbm/state/last_attempt.json", "EFI/sbm/test/chainload-ok.txt"]
+
+[[scenario]]
+id = "sbm-uefi-menu-x86_64-online"
+description = "Same menu and recovery path with user networking. Remote boot selection stays off in policy.json."
+tier = "product"
+profile = "sbm-uefi-x86_64"
+network = "user"
+timeout_secs = 180
+send_key = "c"
+send_key_after = "menu_ready"
+stop_on_expect = true
+screenshot = "qmp"
+expect = ["menu_ready", "key c", "fixture_started", "chainload_returned", "remote"]
+require_files = ["EFI/sbm/test/chainload-ok.txt"]
+
+[[scenario]]
+id = "sbm-uefi-menu-aarch64"
+description = "Boot the real SBM menu on aarch64, press C, and reset back to the menu. The recovery payload is the labeled SBM fixture."
+tier = "product"
+profile = "sbm-uefi-aarch64"
+timeout_secs = 1200
+send_key = "c"
+send_key_after = "menu_ready"
+stop_on_expect = true
+reset_after = "chainload_returned"
+screenshot = "qmp"
+expect = ["menu_ready", "key c", "fixture_started", "chainload_returned"]
+require_files = ["EFI/sbm/handoff/current.json", "EFI/sbm/test/chainload-ok.txt"]
+
+[[scenario]]
+id = "sbm-core-x86_64"
+description = "Boot the real SBM menu into a real SBM Core UKI, then check the kernel, the management service, and the GParted smoke marker. Skipped until the UKI exists."
+tier = "product"
+profile = "sbm-uefi-x86_64"
+network = "user"
+use_core = true
+timeout_secs = 600
+send_key = "c"
+send_key_after = "menu_ready"
+stop_on_serial = ["SBM_SMOKE_DONE"]
+screenshot = "qmp"
+expect = ["menu_ready", "key c"]
+serial_contains = ["Linux version", "SBM_UI_READY", "SBM_SMOKE_DONE"]
+
+[[scenario]]
+id = "sbm-core-x86_64-offline"
+description = "The Core recovery path with no NIC. Skipped until the UKI exists."
+tier = "product"
+profile = "sbm-uefi-x86_64"
+network = "none"
+use_core = true
+timeout_secs = 600
+send_key = "c"
+send_key_after = "menu_ready"
+stop_on_serial = ["SBM_SMOKE_DONE"]
+expect = ["menu_ready", "key c"]
+serial_contains = ["Linux version", "SBM_UI_READY", "SBM_SMOKE_DONE"]
+
+[[scenario]]
+id = "sbm-core-aarch64-offline"
+description = "aarch64 Core recovery with no NIC. Skipped until the UKI exists. A 64 MiB scratch disk is attached for GParted and is not a host disk."
+tier = "product"
+profile = "sbm-uefi-aarch64"
+network = "none"
+use_core = true
+timeout_secs = 900
+send_key = "c"
+send_key_after = "menu_ready"
+stop_on_serial = ["SBM_SMOKE_DONE"]
+expect = ["menu_ready", "key c"]
+serial_contains = ["Linux version", "SBM_UI_READY", "SBM_SMOKE_DONE"]

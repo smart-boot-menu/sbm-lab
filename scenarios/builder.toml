@@ -1,0 +1,9 @@
+[[scenario]]
+id = "linux-dev-ready"
+description = "Boot the Linux build image from a qcow2 overlay and a NoCloud seed. The backing image is not modified."
+tier = "builder"
+profile = "linux-dev"
+timeout_secs = 300
+inject_probe = false
+stop_on_expect = true
+expect = ["build-vm-ready"]

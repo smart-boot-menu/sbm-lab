@@ -180,6 +180,16 @@ pub fn select_accel(
     })
 }
 
+/// aarch64 TCG on an x86 CI runner needs longer than the HVF timeout.
+/// Same-architecture boots keep the requested timeout, including x86 TCG.
+pub fn effective_timeout(host_arch: &str, guest: Arch, requested: u64) -> u64 {
+    if host_arch == guest.host_arch() {
+        requested
+    } else {
+        requested.max(720)
+    }
+}
+
 pub fn cpu_model(accel: Accel, guest: Arch) -> &'static str {
     match (accel, guest) {
         (Accel::Hvf | Accel::Kvm, Arch::Aarch64) => "host",
@@ -201,6 +211,14 @@ mod tests {
             kvm_usable: false,
             qemu_accels: vec!["hvf".into(), "tcg".into()],
         }
+    }
+
+    #[test]
+    fn cross_arch_timeout_grows_and_native_does_not() {
+        assert_eq!(effective_timeout("x86_64", Arch::Aarch64, 240), 720);
+        assert_eq!(effective_timeout("aarch64", Arch::Aarch64, 240), 240);
+        assert_eq!(effective_timeout("aarch64", Arch::X86_64, 180), 720);
+        assert_eq!(effective_timeout("x86_64", Arch::X86_64, 180), 180);
     }
 
     #[test]

@@ -1,0 +1,8 @@
+id = "sbm-uefi-x86_64"
+description = "Actual SBM UEFI menu on OVMF. OS-looking paths are the SBM fixture EFI, not Windows or Linux."
+arch = "x86_64"
+memory_mib = 1024
+cpus = 2
+network = "none"
+boot = "sbm-menu"
+notes = "Requires ../sbm-uefi/artifacts/sbm-x86_64.efi and sbm-fixture-x86_64.efi. A Core UKI replaces slot A only when a product scenario sets use_core."

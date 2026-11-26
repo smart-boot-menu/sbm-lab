@@ -30,8 +30,33 @@ pub fn strip_ansi(input: &str) -> String {
 
 pub fn parse_markers(text: &str) -> Vec<Marker> {
     let clean = strip_ansi(text);
+    let mut markers = parse_prefix(&clean, "SBM-LAB-MARKER:");
+    markers.extend(parse_prefix(&clean, "SBM_MARK "));
+    markers
+}
+
+pub fn log_tail(text: &str, lines: usize) -> String {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let start = kept.len().saturating_sub(lines);
+    kept[start..]
+        .iter()
+        .map(|line| {
+            let mut short = line.chars().take(240).collect::<String>();
+            if line.chars().count() > 240 {
+                short.push('…');
+            }
+            short
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_prefix(clean: &str, prefix: &str) -> Vec<Marker> {
     let mut markers = Vec::new();
-    for (index, part) in clean.split("SBM-LAB-MARKER:").enumerate() {
+    for (index, part) in clean.split(prefix).enumerate() {
         if index == 0 {
             continue;
         }
@@ -111,6 +136,12 @@ mod tests {
         );
         let partial = "SBM-LAB-MARKER:efi-launched\r\nSBM-LAB-MARKER:boo";
         assert_eq!(parse_markers(partial).len(), 1);
+        let menu = "SBM_MARK menu_ready us=15\nSBM_MARK key c\nSBM_MARK fixture_started\n";
+        let marks = parse_markers(menu);
+        assert_eq!(marks[0].name, "menu_ready");
+        assert_eq!(marks[0].fields.get("us").map(String::as_str), Some("15"));
+        assert_eq!(marks[1].raw, "key c");
+        assert_eq!(marks[2].name, "fixture_started");
     }
 
     #[test]

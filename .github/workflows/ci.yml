@@ -41,3 +41,76 @@ jobs:
             echo "KVM is absent. x86 and aarch64 guests will use TCG."
           fi
           ./target/release/sbm-lab test --tier smoke
+      - name: Upload smoke logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: |
+            var/runs/**/serial.log
+            var/runs/**/debugcon.log
+            var/runs/**/qemu.stderr
+            var/runs/**/result.json
+
+  product:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: smart-boot-menu/sbm-uefi
+          path: sbm-uefi-src
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install QEMU and firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-system-arm qemu-utils ovmf qemu-efi-aarch64
+      - name: Build the lab
+        run: cargo build --release
+      - name: Product boot
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "KVM is absent. aarch64 guests will use TCG."
+          fi
+          ./target/release/sbm-lab test --tier product
+      - name: Upload product logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-logs
+          path: |
+            var/runs/**/serial.log
+            var/runs/**/qemu.stderr
+            var/runs/**/result.json
+            var/runs/**/screenshot.ppm
+
+  secure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi
+      - name: Install QEMU, firmware, and signing tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils ovmf osslsigncode python3-pip python3-venv libcrypt-dev
+      - name: Build the lab and the UEFI probe
+        run: |
+          cargo build --release
+          cargo build --manifest-path fixtures/efi-probe/Cargo.toml --release --target x86_64-unknown-uefi
+      - name: Enroll development keys and boot
+        run: |
+          ./target/release/sbm-lab setup --secure-boot
+          ./target/release/sbm-lab test --tier secure
+      - name: Upload secure boot logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-logs
+          path: |
+            var/runs/**/serial.log
+            var/runs/**/qemu.stderr
+            var/runs/**/result.json

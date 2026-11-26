@@ -1,0 +1,9 @@
+id = "x86_64-secure-enrolled"
+description = "OVMF with the lab development PK, KEK, and db enrolled. Separate from the ordinary boot test."
+arch = "x86_64"
+secure_boot = true
+memory_mib = 1024
+cpus = 2
+network = "none"
+vars_template = "var/secure-boot/enrolled.fd"
+notes = "Create the keys with sbm-lab setup --secure-boot. They are development keys and stay in var/secure-boot."

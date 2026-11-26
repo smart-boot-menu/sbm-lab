@@ -7,6 +7,9 @@ Profiles live in `profiles/*.toml`. Unknown keys are rejected. `sbm-lab list --p
 | `x86_64-uefi` | q35 + OVMF | Default x86 UEFI guest. TCG on Apple Silicon. Attaches `multi-efi`. |
 | `aarch64-uefi` | virt + AAVMF | HVF on Apple Silicon, KVM on a matching Linux host. Attaches `multi-efi` and `linux-bls`. Software framebuffer is `ramfb`. |
 | `x86_64-uefi-secure-boot` | q35, SMM on | Secure Boot firmware. The bundled variable store is not key-enrolled. |
+| `x86_64-secure-enrolled` | q35, SMM on | Development PK, KEK, and db from `sbm-lab setup --secure-boot`. Unsigned and tampered EFI are rejected. |
+| `sbm-uefi-x86_64` | q35 | The real SBM UEFI menu. OS-looking paths on its ESP are the SBM fixture EFI. |
+| `sbm-uefi-aarch64` | virt | The real SBM UEFI menu for aarch64. |
 | `ia32-uefi` | q35 + IA32 OVMF | Firmware shell. The lab probe is not an IA32 PE. |
 | `uboot-efi` | virt + U-Boot `-bios`, TCG | Needs `var/firmware/u-boot-qemu-arm64.bin`. HVF aborts in QEMU 11.1.3 before U-Boot prints a banner, so this profile forces TCG. |
 | `legacy-bios` | pc + SeaBIOS | No pflash and no probe disk. Looks for a SeaBIOS banner. |
@@ -18,7 +21,7 @@ Profiles live in `profiles/*.toml`. Unknown keys are rejected. `sbm-lab list --p
 | `x86_64-offline` | q35 | No NIC. |
 | `x86_64-virtio-gpu` | q35 | `virtio-vga`. |
 | `aarch64-virtio-gpu` | virt | `virtio-gpu-pci`. |
-| `linux-dev` | virt, build-vm role | Shared Linux build VM. `setup --build-vm` downloads the image. `run linux-dev` does not boot it yet. |
+| `linux-dev` | virt, build-vm role | Boots a qcow2 overlay of the Ubuntu cloud image in `var/build-vm`, or `../sbm-core/build/builder/Fedora-Cloud-Base-*.qcow2` when that file is the one present. A NoCloud seed is attached. The backing image is not written. |
 
 Headless display is `-display none` plus an explicit VGA, ramfb, or virtio GPU device, because `-nodefaults` removes the default display. This QEMU build has no VNC backend. `--graphical` selects `cocoa`.
 

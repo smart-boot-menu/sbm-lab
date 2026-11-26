@@ -14,6 +14,14 @@ pub enum Role {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum BootKind {
+    #[default]
+    Probe,
+    SbmMenu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum GpuKind {
     #[default]
     Software,
@@ -60,6 +68,11 @@ pub struct Profile {
     #[serde(default)]
     pub role: Role,
     #[serde(default)]
+    pub boot: BootKind,
+    /// Path relative to the lab root. Replaces the firmware variable template.
+    #[serde(default)]
+    pub vars_template: Option<String>,
+    #[serde(default)]
     pub notes: String,
 }
 
@@ -79,6 +92,9 @@ pub enum Tier {
     Smoke,
     Full,
     Fault,
+    Product,
+    Secure,
+    Builder,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -141,6 +157,27 @@ pub struct Scenario {
     pub memory_mib: Option<u32>,
     #[serde(default)]
     pub network: Option<NetworkMode>,
+    #[serde(default)]
+    pub boot: BootKind,
+    #[serde(default)]
+    pub send_key_after: Option<String>,
+    #[serde(default)]
+    pub stop_on_expect: bool,
+    #[serde(default)]
+    pub stop_on_serial: Vec<String>,
+    #[serde(default)]
+    pub forbid_markers: Vec<String>,
+    #[serde(default)]
+    pub serial_contains_any: Vec<String>,
+    #[serde(default)]
+    pub require_files: Vec<String>,
+    #[serde(default)]
+    pub reset_after: Option<String>,
+    /// `signed`, `unsigned`, or `tampered` for the Secure Boot tier.
+    #[serde(default)]
+    pub efi_variant: Option<String>,
+    #[serde(default)]
+    pub use_core: bool,
 }
 
 fn default_timeout() -> u64 {
