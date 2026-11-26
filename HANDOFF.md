@@ -56,6 +56,10 @@ GitHub Actions run 45879871319 failed in the smoke job. x86_64 passed. `aarch64-
 
 Each run has its own directory under `var/runs/<id>`, its own variable-store copy, and its own qcow2 overlays. `var/fixtures/.lock` is an exclusive flock around fixture creation. Paths under `/dev`, block devices, and paths that contain a comma are rejected. Two agents should still use separate checkouts or `SBM_LAB_ROOT` if they need separate firmware and key directories. The enrolled Secure Boot keys live only in `var/secure-boot`.
 
+## Catalog installer ISOs
+
+`docs/installer-boot.md` points at `sbm-catalog/tools/boot-installer.sh`. That script is the path for Debian, openSUSE, and Fedora aarch64 installer logs. The lab launch plan still has no CD-ROM argument and still rejects `/dev` paths. Those installer runs are not lab scenario passes.
+
 ## Still open
 
 - No SBM Core UKI was present. `sbm-core-x86_64`, `sbm-core-x86_64-offline`, and `sbm-core-aarch64-offline` skip. They expect `Linux version`, `SBM_UI_READY`, and `SBM_SMOKE_DONE` on serial, and they attach a 64 MiB scratch disk that is not a host disk. Those scenarios have not booted a kernel, a management shell, or GParted.

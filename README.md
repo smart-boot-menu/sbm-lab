@@ -4,6 +4,8 @@
 
 The Apple Silicon U-Boot EFI probe is a separate script, not this harness. QEMU `virt` is not an Apple Silicon Mac. See [scenarios/exp-as-ext01-phase1.md](scenarios/exp-as-ext01-phase1.md).
 
+Installer ISO boots stay in `sbm-catalog/tools/boot-installer.sh`. This harness does not grow a host-disk path for them. See [docs/installer-boot.md](docs/installer-boot.md).
+
 ## Commands other agents should use
 
 ```bash
