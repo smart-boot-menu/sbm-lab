@@ -46,12 +46,11 @@ mode = "observe"
 
 [[scenario]]
 id = "uboot-serial"
-description = "Boot U-Boot qemu_arm64 and look for its banner."
+description = "Boot U-Boot qemu_arm64 under TCG and run the lab probe."
 tier = "full"
 profile = "uboot-efi"
-timeout_secs = 120
-mode = "serial"
-serial_contains = ["U-Boot"]
+timeout_secs = 180
+expect = ["efi-launched", "halt"]
 
 [[scenario]]
 id = "ia32-shell"

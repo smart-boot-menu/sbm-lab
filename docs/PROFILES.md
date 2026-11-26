@@ -8,7 +8,7 @@ Profiles live in `profiles/*.toml`. Unknown keys are rejected. `sbm-lab list --p
 | `aarch64-uefi` | virt + AAVMF | HVF on Apple Silicon, KVM on a matching Linux host. Attaches `multi-efi` and `linux-bls`. Software framebuffer is `ramfb`. |
 | `x86_64-uefi-secure-boot` | q35, SMM on | Secure Boot firmware. The bundled variable store is not key-enrolled. |
 | `ia32-uefi` | q35 + IA32 OVMF | Firmware shell. The lab probe is not an IA32 PE. |
-| `uboot-efi` | virt + U-Boot `-bios` | Needs `var/firmware/u-boot-qemu-arm64.bin` from `setup --uboot`. |
+| `uboot-efi` | virt + U-Boot `-bios`, TCG | Needs `var/firmware/u-boot-qemu-arm64.bin`. HVF aborts in QEMU 11.1.3 before U-Boot prints a banner, so this profile forces TCG. |
 | `legacy-bios` | pc + SeaBIOS | No pflash and no probe disk. Looks for a SeaBIOS banner. |
 | `x86_64-uefi-tpm` | q35 + swtpm | TPM is attached. PCR values are not asserted. |
 | `x86_64-lowmem` | q35, 512 MiB | Low-memory profile. Fault tests can lower it to 256 MiB. |

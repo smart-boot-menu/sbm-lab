@@ -1,4 +1,4 @@
-use crate::accel::Arch;
+use crate::accel::{AccelRequest, Arch};
 use crate::error::{Error, Result};
 use serde::Deserialize;
 use std::fs;
@@ -55,6 +55,8 @@ pub struct Profile {
     pub usb: bool,
     #[serde(default)]
     pub disks: Vec<String>,
+    #[serde(default)]
+    pub accel: AccelRequest,
     #[serde(default)]
     pub role: Role,
     #[serde(default)]

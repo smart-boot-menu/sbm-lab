@@ -122,7 +122,12 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
         kvm_usable: live.kvm_usable,
         qemu_accels: accels,
     };
-    let choice = select_accel(&facts, arch, opts.accel).map_err(Error::message)?;
+    let request = if opts.accel == AccelRequest::Auto {
+        opts.profile.accel
+    } else {
+        opts.accel
+    };
+    let choice = select_accel(&facts, arch, request).map_err(Error::message)?;
     let machine = if arch == Arch::Aarch64 {
         "virt,gic-version=3".into()
     } else if opts.profile.machine == "virt" {

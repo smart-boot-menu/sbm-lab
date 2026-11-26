@@ -29,4 +29,4 @@ A 10-run aarch64 HVF sample of host milliseconds until `efi-launched` is methodo
 - There is no IA32 build of the probe. The IA32 profile stops at the firmware shell.
 - NTFS, Btrfs, and LUKS1 fixtures are synthetic headers.
 - SBM UEFI and SBM Core images are accepted with `--efi` and `--core` when those builds exist. The smoke tier uses the lab probe.
-- U-Boot `v2026.10` with `CONFIG_EFI_LOADER=y` builds into `var/firmware/u-boot-qemu-arm64.bin`. The separate Apple Silicon probe script is [scripts/run-uboot-efi-probe.sh](scripts/run-uboot-efi-probe.sh). QEMU `virt` is not an Apple Silicon Mac, and that probe's passing accelerator on this host was TCG after HVF aborted.
+- U-Boot `v2026.10` with `CONFIG_EFI_LOADER=y` builds into `var/firmware/u-boot-qemu-arm64.bin`. `uboot-efi` forces TCG because QEMU 11.1.3 HVF aborts in `hvf_handle_exception` before U-Boot prints a banner. Under TCG it starts the lab probe. The separate Apple Silicon probe script is [scripts/run-uboot-efi-probe.sh](scripts/run-uboot-efi-probe.sh). QEMU `virt` is not an Apple Silicon Mac.
