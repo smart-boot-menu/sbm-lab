@@ -1318,20 +1318,18 @@ pub fn tie_to_parent(command: &mut Command) {
         use std::os::unix::process::CommandExt;
         unsafe {
             command.pre_exec(|| {
-                let rc = unsafe {
-                    libc::prctl(
-                        libc::PR_SET_PDEATHSIG,
-                        libc::SIGKILL as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                    )
-                };
+                let rc = libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                );
                 if rc != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if unsafe { libc::getppid() } == 1 {
-                    unsafe { libc::raise(libc::SIGKILL) };
+                if libc::getppid() == 1 {
+                    libc::raise(libc::SIGKILL);
                 }
                 Ok(())
             });
