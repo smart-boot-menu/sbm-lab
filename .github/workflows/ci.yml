@@ -9,11 +9,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify repository baseline (Cargo checks activate once Cargo.toml is added)
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format, clippy, and unit tests
         run: |
-          test -f README.md && test -f AGENTS.md
-          if [ -f Cargo.toml ]; then
-            cargo fmt --all -- --check
-            cargo clippy --all-targets -- -D warnings
-            cargo test --workspace
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --workspace
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-uefi,aarch64-unknown-uefi
+      - name: Install QEMU and firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-system-arm qemu-utils ovmf qemu-efi-aarch64 swtpm
+      - name: Build the lab and the UEFI probe
+        run: |
+          cargo build --release
+          cargo build --manifest-path fixtures/efi-probe/Cargo.toml --release \
+            --target x86_64-unknown-uefi --target aarch64-unknown-uefi
+      - name: Smoke boot
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "KVM is absent. x86 and aarch64 guests will use TCG."
           fi
+          ./target/release/sbm-lab test --tier smoke

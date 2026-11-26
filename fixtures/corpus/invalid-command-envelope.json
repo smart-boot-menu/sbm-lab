@@ -1,0 +1,7 @@
+{
+  "note": "INTENTIONALLY INVALID. This is a lab corpus file, not a CommandEnvelope. It omits signature_ed25519_hex, sequence, and the other required fields from sbm-common/schemas/command-envelope.v1.schema.json.",
+  "payload": {
+    "action": "boot_target",
+    "target_id": "not-a-real-target"
+  }
+}

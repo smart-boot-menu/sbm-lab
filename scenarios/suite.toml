@@ -1,0 +1,178 @@
+[[scenario]]
+id = "x86_64-efi-launch"
+description = "Boot the lab probe on x86_64 OVMF, discover three EFI files, inject a key, and capture a QMP screenshot."
+tier = "smoke"
+profile = "x86_64-uefi"
+timeout_secs = 180
+send_key = "ret"
+screenshot = "qmp"
+expect = ["efi-launched", "gop-ready", "discovery-done", "key-received", "halt"]
+require_paths = ["alpha.efi", "beta.efi", "gamma.efi"]
+
+[[scenario]]
+id = "aarch64-efi-launch"
+description = "Boot the lab probe on aarch64 UEFI and discover EFI files on two fixture disks."
+tier = "smoke"
+profile = "aarch64-uefi"
+timeout_secs = 240
+screenshot = "any"
+expect = ["efi-launched", "discovery-done", "disk-id", "halt"]
+require_paths = ["alpha.efi", "synthetic.efi"]
+
+[[scenario]]
+id = "aarch64-chainload"
+description = "Chainload the lab payload from the probe disk. The second aarch64 boot also checks that fixture backings were not modified."
+tier = "smoke"
+profile = "aarch64-uefi"
+timeout_secs = 240
+chainload = true
+expect = ["efi-launched", "chainload-start", "chainload-ok", "halt"]
+
+[[scenario]]
+id = "secure-boot-observe"
+description = "Boot the Secure Boot firmware profile. The bundled variable store is not key-enrolled, so this records what happens."
+tier = "full"
+profile = "x86_64-uefi-secure-boot"
+timeout_secs = 180
+mode = "observe"
+
+[[scenario]]
+id = "tpm-observe"
+description = "Boot with a swtpm socket attached. PCR values are not asserted."
+tier = "full"
+profile = "x86_64-uefi-tpm"
+timeout_secs = 180
+mode = "observe"
+
+[[scenario]]
+id = "uboot-serial"
+description = "Boot U-Boot qemu_arm64 and look for its banner."
+tier = "full"
+profile = "uboot-efi"
+timeout_secs = 120
+mode = "serial"
+serial_contains = ["U-Boot"]
+
+[[scenario]]
+id = "ia32-shell"
+description = "Reach the IA32 UEFI shell. The lab probe is not an IA32 binary."
+tier = "full"
+profile = "ia32-uefi"
+timeout_secs = 120
+mode = "serial"
+inject_probe = false
+serial_contains = ["UEFI Interactive Shell"]
+
+[[scenario]]
+id = "legacy-bios-banner"
+description = "Look for a SeaBIOS banner on the debug console."
+tier = "full"
+profile = "legacy-bios"
+timeout_secs = 60
+mode = "serial"
+inject_probe = false
+serial_contains = ["SeaBIOS"]
+
+[[scenario]]
+id = "virtio-gpu"
+description = "Boot aarch64 with virtio-gpu and accept either screenshot source."
+tier = "full"
+profile = "aarch64-virtio-gpu"
+timeout_secs = 180
+screenshot = "any"
+expect = ["efi-launched", "halt"]
+
+[[scenario]]
+id = "offline-markers"
+description = "Boot with no NIC and still discover EFI targets."
+tier = "full"
+profile = "x86_64-offline"
+timeout_secs = 180
+expect = ["efi-launched", "discovery-done", "halt"]
+
+[[scenario]]
+id = "usb-observe"
+description = "Attach the fixture as USB mass storage. Safety is the pass condition."
+tier = "full"
+profile = "x86_64-usb"
+timeout_secs = 180
+mode = "observe"
+
+[[scenario]]
+id = "fault-power-loss"
+description = "Kill QEMU after the guest starts a journal. Only the overlay may change."
+tier = "fault"
+profile = "aarch64-uefi"
+timeout_secs = 180
+mode = "power-loss"
+journal = true
+fixture = "multi-efi"
+
+[[scenario]]
+id = "fault-io-error"
+description = "Inject read errors on fixture overlays. The probe disk stays readable."
+tier = "fault"
+profile = "aarch64-uefi"
+timeout_secs = 180
+mode = "observe"
+io_error = true
+fixture = "multi-efi"
+
+[[scenario]]
+id = "fault-net-down"
+description = "Drop the virtual NIC after QMP connects."
+tier = "fault"
+profile = "aarch64-uefi"
+timeout_secs = 180
+mode = "observe"
+network = "user"
+drop_link = true
+fixture = "multi-efi"
+
+[[scenario]]
+id = "fault-slow-net"
+description = "Connect the guest NIC through a delaying proxy."
+tier = "fault"
+profile = "aarch64-uefi"
+timeout_secs = 180
+mode = "observe"
+network = "slow"
+fixture = "multi-efi"
+
+[[scenario]]
+id = "fault-corrupt-config"
+description = "A fixture policy file is not valid JSON."
+tier = "fault"
+profile = "aarch64-uefi"
+timeout_secs = 180
+fixture = "corrupt-config"
+expect = ["efi-launched", "config-invalid", "halt"]
+
+[[scenario]]
+id = "fault-missing-boot"
+description = "A fixture advertises a boot target that is not on the disk."
+tier = "fault"
+profile = "aarch64-uefi"
+timeout_secs = 180
+fixture = "missing-boot"
+expect = ["efi-launched", "note id=missing-boot", "halt"]
+
+[[scenario]]
+id = "fault-broken-vars"
+description = "The per-run variable-store copy is corrupted. The template file must stay unchanged."
+tier = "fault"
+profile = "aarch64-uefi"
+timeout_secs = 120
+mode = "observe"
+corrupt_vars = true
+fixture = "empty-gpt"
+
+[[scenario]]
+id = "fault-low-memory"
+description = "Boot the probe with 256 MiB."
+tier = "fault"
+profile = "x86_64-lowmem"
+timeout_secs = 180
+mode = "observe"
+memory_mib = 256
+fixture = "empty-gpt"

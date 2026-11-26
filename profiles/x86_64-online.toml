@@ -1,0 +1,8 @@
+id = "x86_64-online"
+description = "User-mode network. The NIC MAC is the QEMU OUI, not the host MAC."
+arch = "x86_64"
+machine = "q35"
+memory_mib = 2048
+cpus = 2
+network = "user"
+disks = ["multi-efi"]

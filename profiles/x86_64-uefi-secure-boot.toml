@@ -1,0 +1,10 @@
+id = "x86_64-uefi-secure-boot"
+description = "OVMF Secure Boot firmware. The bundled variable store is not enrolled with keys."
+arch = "x86_64"
+machine = "q35"
+memory_mib = 2048
+cpus = 2
+secure_boot = true
+network = "none"
+disks = ["multi-efi"]
+notes = "SMM is enabled because the firmware descriptor requires it. Unsigned images may still launch until keys are enrolled."

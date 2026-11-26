@@ -1,0 +1,17 @@
+# Pinned third-party source used by `sbm-lab setup --uboot`.
+# The SHA-256 was computed on the dev workstation on 2026-11-26 from the
+# GitHub tag archive. Firmware binaries from QEMU are not vendored.
+
+[uboot]
+version = "v2026.10"
+url = "https://github.com/u-boot/u-boot/archive/refs/tags/v2026.10.tar.gz"
+sha256 = "f943a88389c8fd70a6b0d061a88267465e143c7ca6ea2b75837ab20f5b60c739"
+defconfig = "qemu_arm64_defconfig"
+
+[build_vm]
+# setup --build-vm reads SHA256SUMS and picks the matching cloud image.
+# The hash is recorded in var/build-vm/image.lock after download, not here,
+# because Ubuntu point-release directories move.
+sha256sums_url = "https://cloud-images.ubuntu.com/releases/noble/release/SHA256SUMS"
+arm64_match = "server-cloudimg-arm64.img"
+amd64_match = "server-cloudimg-amd64.img"

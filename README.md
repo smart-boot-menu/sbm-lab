@@ -1,24 +1,38 @@
 # Virtual Hardware, Benchmarks & Integration Testing (`sbm-lab`)
 
-Automated QEMU (`x86_64` + `aarch64`), EDK2 OVMF/AAVMF, Das U-Boot `qemu_arm64`, and `swtpm` virtual hardware lab, golden QCOW2 disk fixtures, benchmarks, and fault-injection suites.
+`sbm-lab` boots disposable QEMU machines so other Smart Boot Menu agents can test UEFI and SBM Core artifacts without touching the host disk or the Mac boot configuration. Destructive storage tests use QCOW2 overlays. Golden images and firmware variable templates are hashed before and after every run.
 
-> **Project Status:** Phase 0 initialized — ready for dedicated engineering agent implementation targeting **SBM 0.1**.
+The Apple Silicon U-Boot EFI probe is a separate script, not this harness. QEMU `virt` is not an Apple Silicon Mac. See [scenarios/exp-as-ext01-phase1.md](scenarios/exp-as-ext01-phase1.md).
 
-## Scope & Responsibilities
+## Commands other agents should use
 
-- Reproducible Rust integration harness running `sbm-uefi`, `sbm-core`, `sbm-server`, `install`, and `sbm-agent` end-to-end across OVMF (standard + Secure Boot), AAVMF, and U-Boot `qemu_arm64`.
-- Native-speed ARM64 virtualization (`-accel hvf` on an M-series Mac; `-accel kvm` on Linux CI) + TCG fallback. HVF is not assumed: the 2026-11-26 U-Boot probe passed under TCG after HVF aborted. Scenario: [scenarios/exp-as-ext01-phase1.md](scenarios/exp-as-ext01-phase1.md).
-- Golden QCOW2 disk fixtures (Windows/BitLocker, multi-Linux BLS/UKI, Apple-protected guardrails, corrupt GPT).
-- QMP `screendump` assertions, boot latency measurement harnesses, and power-cut/network/disk fault injection.
+```bash
+cargo run -p sbm-lab -- doctor
+cargo run -p sbm-lab -- setup
+cargo run -p sbm-lab -- list
+cargo run -p sbm-lab -- run aarch64-uefi --efi path/to/app.efi
+cargo run -p sbm-lab -- test --tier smoke
+cargo run -p sbm-lab -- benchmark --profile aarch64-uefi --runs 10 --output bench.json
+```
 
-## Canonical Documentation & Contracts
+The full contract is [docs/CLI.md](docs/CLI.md). Profiles are [docs/PROFILES.md](docs/PROFILES.md). Disk fixtures are [docs/FIXTURES.md](docs/FIXTURES.md). What is verified, and what is still partial, is [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
 
-- Central coordination & roadmap: [`smart-boot-menu/sbm`](https://github.com/smart-boot-menu/sbm)
-- Normative specifications & ADRs: [`smart-boot-menu/docs`](https://github.com/smart-boot-menu/docs)
-- Primary-source technical research: [`smart-boot-menu/research`](https://github.com/smart-boot-menu/research)
-- Shared Rust types & JSON Schemas: [`smart-boot-menu/sbm-common`](https://github.com/smart-boot-menu/sbm-common)
-- Agent guide: [AGENTS.md](AGENTS.md)
+## What a run does
+
+1. Selects HVF or KVM only when the guest architecture matches the host and that QEMU binary lists the accelerator. Otherwise it uses TCG. On this Apple Silicon Mac, x86 guests are TCG.
+2. Copies the firmware variable store. The template file is never written.
+3. Builds a per-run probe disk and QCOW2 overlays of the requested fixtures.
+4. Boots headless, reads `SBM-LAB-MARKER:` lines from the serial console, and can capture a QMP PPM screenshot.
+5. Re-hashes the firmware code, the variable template, and the fixture backing files. A change fails the run.
+
+## Layout
+
+- `crates/sbm-lab` — the CLI.
+- `fixtures/efi-probe` — the UEFI probe and chainload payload. It is outside the default Cargo workspace.
+- `profiles/` and `scenarios/` — machine and test definitions.
+- `firmware/sources.toml` — pinned U-Boot source URL and SHA-256.
+- `var/` — gitignored firmware, fixtures, and run state.
 
 ## License
 
-Original code and documentation in this repository are dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), subject to third-party licensing requirements for bundled external components.
+Original code and documentation in this repository are dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE). QEMU is invoked as a subprocess and is not linked.

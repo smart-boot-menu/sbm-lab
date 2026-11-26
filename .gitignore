@@ -1,4 +1,6 @@
 /target
+/var
+/fixtures/efi-probe/target
 **/*.rs.bk
 *.pdb
 .DS_Store

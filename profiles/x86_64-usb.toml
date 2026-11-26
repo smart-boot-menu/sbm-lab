@@ -1,0 +1,9 @@
+id = "x86_64-usb"
+description = "The last fixture disk is a removable USB mass-storage device."
+arch = "x86_64"
+machine = "q35"
+memory_mib = 2048
+cpus = 2
+usb = true
+network = "none"
+disks = ["multi-efi"]

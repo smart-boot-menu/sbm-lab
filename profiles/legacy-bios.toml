@@ -1,0 +1,8 @@
+id = "legacy-bios"
+description = "SeaBIOS research machine. No UEFI firmware and no probe injection."
+arch = "x86_64"
+machine = "pc"
+memory_mib = 512
+cpus = 1
+network = "none"
+notes = "Looks for a SeaBIOS banner on the debug console. Not a boot-menu test."

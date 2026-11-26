@@ -1,0 +1,9 @@
+id = "x86_64-lowmem"
+description = "Low-memory laptop profile."
+arch = "x86_64"
+machine = "q35"
+memory_mib = 512
+cpus = 1
+network = "none"
+disks = ["multi-efi"]
+notes = "Fault tests may lower this further to 256 MiB."

@@ -1,0 +1,9 @@
+id = "aarch64-virtio-gpu"
+description = "virtio-gpu-pci on the virt machine."
+arch = "aarch64"
+machine = "virt"
+memory_mib = 2048
+cpus = 2
+gpu = "virtio"
+network = "none"
+disks = ["multi-efi"]

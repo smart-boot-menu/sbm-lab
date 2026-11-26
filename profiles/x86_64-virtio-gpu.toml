@@ -1,0 +1,9 @@
+id = "x86_64-virtio-gpu"
+description = "virtio-vga instead of the default VGA device."
+arch = "x86_64"
+machine = "q35"
+memory_mib = 2048
+cpus = 2
+gpu = "virtio"
+network = "none"
+disks = ["multi-efi"]

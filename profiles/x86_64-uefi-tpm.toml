@@ -1,0 +1,10 @@
+id = "x86_64-uefi-tpm"
+description = "OVMF plus a swtpm 2.0 socket. Does not assert PCR values."
+arch = "x86_64"
+machine = "q35"
+memory_mib = 2048
+cpus = 2
+tpm = true
+network = "none"
+disks = ["multi-efi"]
+notes = "swtpm state is created inside the run directory."

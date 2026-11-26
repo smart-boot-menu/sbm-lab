@@ -1,0 +1,8 @@
+id = "x86_64-offline"
+description = "No NIC."
+arch = "x86_64"
+machine = "q35"
+memory_mib = 2048
+cpus = 2
+network = "none"
+disks = ["multi-efi"]

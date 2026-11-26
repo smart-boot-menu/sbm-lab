@@ -1,0 +1,10 @@
+id = "linux-dev"
+description = "Shared aarch64 Linux build VM for mkosi. Not started by the smoke suite."
+arch = "aarch64"
+machine = "virt"
+memory_mib = 4096
+cpus = 4
+network = "user"
+guest_agent = true
+role = "build-vm"
+notes = "Prepare the Ubuntu cloud image with sbm-lab setup --build-vm. The image stays in var/build-vm and is not a proprietary OS redistributed by this repo."

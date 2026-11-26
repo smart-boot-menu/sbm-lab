@@ -1,0 +1,9 @@
+id = "uboot-efi"
+description = "U-Boot qemu_arm64 with CONFIG_EFI_LOADER, then the lab probe."
+arch = "aarch64"
+machine = "virt"
+memory_mib = 1024
+cpus = 2
+network = "none"
+disks = ["multi-efi"]
+notes = "Requires var/firmware/u-boot-qemu-arm64.bin from sbm-lab setup --uboot."

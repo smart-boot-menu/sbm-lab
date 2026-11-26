@@ -1,0 +1,10 @@
+id = "aarch64-uefi"
+description = "virt + AAVMF. Uses HVF on Apple Silicon and KVM on a matching Linux host."
+arch = "aarch64"
+machine = "virt"
+memory_mib = 2048
+cpus = 2
+gpu = "software"
+network = "none"
+disks = ["multi-efi", "linux-bls"]
+notes = "ramfb software framebuffer. Two fixture disks plus the probe disk."

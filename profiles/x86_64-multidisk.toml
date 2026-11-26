@@ -1,0 +1,8 @@
+id = "x86_64-multidisk"
+description = "Two virtual disks behind the probe disk."
+arch = "x86_64"
+machine = "q35"
+memory_mib = 2048
+cpus = 2
+network = "none"
+disks = ["multi-efi", "linux-bls"]

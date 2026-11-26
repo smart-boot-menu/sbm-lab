@@ -1,0 +1,10 @@
+id = "x86_64-uefi"
+description = "q35 + OVMF. On Apple Silicon this is TCG, not HVF."
+arch = "x86_64"
+machine = "q35"
+memory_mib = 2048
+cpus = 2
+gpu = "software"
+network = "none"
+disks = ["multi-efi"]
+notes = "Secure Boot off. Variable store is a per-run copy."

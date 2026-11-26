@@ -1,0 +1,9 @@
+id = "ia32-uefi"
+description = "IA32 OVMF research profile. The lab probe is not an IA32 binary."
+arch = "ia32"
+machine = "q35"
+memory_mib = 1024
+cpus = 1
+network = "none"
+disks = ["empty-gpt"]
+notes = "Boot reaches the firmware shell. Pass a prebuilt IA32 EFI with --efi only if its PE machine is 0x14c."
