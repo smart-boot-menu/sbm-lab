@@ -1,4 +1,5 @@
 fn main() {
+    sbm_lab::resources::install_cancel_handlers();
     let code = match sbm_lab::cli::execute() {
         Ok(code) => code,
         Err(err) => {

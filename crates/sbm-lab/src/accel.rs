@@ -190,9 +190,15 @@ pub fn effective_timeout(host_arch: &str, guest: Arch, requested: u64) -> u64 {
     }
 }
 
-pub fn cpu_model(accel: Accel, guest: Arch) -> &'static str {
+pub fn cpu_model(accel: Accel, guest: Arch, host_arch: &str) -> &'static str {
     match (accel, guest) {
         (Accel::Hvf | Accel::Kvm, Arch::Aarch64) => "host",
+        // `-cpu max` enables pointer authentication. AAVMF 2025.11 on an x86
+        // GitHub runner printed only the version line for the whole 720 s
+        // smoke timeout and the 1200 s product timeout. cortex-a57 is the
+        // CPU that image is built for. Same-architecture TCG stays on `max`;
+        // the measured U-Boot TCG boot on this Mac used that model.
+        (Accel::Tcg, Arch::Aarch64) if host_arch != guest.host_arch() => "cortex-a57",
         (Accel::Tcg, Arch::Aarch64) => "max",
         (_, Arch::Ia32) => "qemu32",
         _ => "qemu64",
@@ -234,8 +240,15 @@ mod tests {
     fn apple_silicon_uses_hvf_for_aarch64() {
         let choice = select_accel(&mac_m5(), Arch::Aarch64, AccelRequest::Auto).unwrap();
         assert_eq!(choice.accel, Accel::Hvf);
-        assert_eq!(cpu_model(choice.accel, Arch::Aarch64), "host");
+        assert_eq!(cpu_model(choice.accel, Arch::Aarch64, "aarch64"), "host");
         assert!(!choice.representative_of_physical_hardware);
+    }
+
+    #[test]
+    fn cross_arch_tcg_avoids_cpu_max() {
+        assert_eq!(cpu_model(Accel::Tcg, Arch::Aarch64, "x86_64"), "cortex-a57");
+        assert_eq!(cpu_model(Accel::Tcg, Arch::Aarch64, "aarch64"), "max");
+        assert_eq!(cpu_model(Accel::Kvm, Arch::Aarch64, "aarch64"), "host");
     }
 
     #[test]

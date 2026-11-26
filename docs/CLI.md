@@ -170,6 +170,6 @@ sbm-lab resources release --id ID
 sbm-lab resources run --workload linux --memory 2048 --cpus 2 --timeout 75 -- qemu-system-aarch64 ...
 ```
 
-`doctor` exits 1 when memory pressure is critical, guest RAM is over the budget, a reservation is orphaned, or a QEMU process has no reservation. `status` always exits 0. `reserve` prints the id. `release` deletes that record and does not signal QEMU. `--forget` deletes it while the process is still running. `run` kills only the command it started.
+`doctor` exits 1 when memory pressure is critical, guest RAM is over the budget, a reservation is orphaned, or a QEMU process has no reservation. `status` always exits 0. `reserve` prints the id. `--owner` records the shell pid; helpers also export `SBM_OWNER_PID`. `release` deletes that record and does not signal QEMU. `--forget` deletes it while the process is still running. `run` kills only the command it started, and only while that pid still has the start time recorded at attach. SIGINT and SIGTERM kill that same pid.
 
 The ledger is `~/Library/Application Support/sbm-lab` on macOS and `$XDG_STATE_HOME/sbm-lab` elsewhere. `SBM_LAB_RUNTIME` overrides it. Details, the measured budget, and the launchers that used to skip the lab are in [RESOURCES.md](RESOURCES.md).

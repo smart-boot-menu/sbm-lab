@@ -3,7 +3,7 @@
 Verified on the Apple M5 dev Mac with QEMU 11.1.3 on 2026-11-26:
 
 - `qemu-system-aarch64 -accel help` lists `hvf` and `tcg`. `qemu-system-x86_64 -accel help` lists only `tcg`. The lab refuses to treat HVF as an x86 accelerator on this host.
-- The firmware banner that actually boots is `edk2-stable202408-prebuilt.qemu.org`. ADR-008 names `edk2-stable202611`. The lab records the banner it observed. A newer firmware can be dropped in through `SBM_LAB_FIRMWARE` or `var/firmware`.
+- The firmware banner that actually boots on this Mac is `edk2-stable202408-prebuilt.qemu.org`. ADR-008 names `edk2-stable202611`. GitHub `ubuntu-latest` AAVMF reported `2025.11-3ubuntu7.4` on 2026-11-26, and the lab records that version token as well. A newer firmware can be dropped in through `SBM_LAB_FIRMWARE` or `var/firmware`.
 - x86 OVMF code is 3,653,632 bytes and the variable template is 540,672 bytes. They are used as a split pflash pair and are not padded.
 - Headless screenshots are QMP `screendump` PPM files. This QEMU has no VNC display. `--graphical` is `cocoa`.
 - U-Boot `v2026.10` `qemu_arm64` builds with `CONFIG_EFI_LOADER=y` when GNU make and `aarch64-elf-gcc` are installed. The binary is gitignored under `var/firmware`. On this host QEMU 11.1.3 HVF aborts inside `hvf_handle_exception` before U-Boot prints a banner, so the `uboot-efi` profile uses TCG.

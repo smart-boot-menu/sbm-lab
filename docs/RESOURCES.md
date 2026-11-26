@@ -15,23 +15,26 @@ Other repositories can call `scripts/sbm-resources.sh` the same way (`reserve`, 
 
 On macOS the directory is `~/Library/Application Support/sbm-lab`. Elsewhere it is `$XDG_STATE_HOME/sbm-lab`, or `~/.local/state/sbm-lab`. `SBM_LAB_RUNTIME` overrides it. `SBM_VM_MAX_CONCURRENT` defaults to 2. `SBM_VM_MAX_HEAVY` defaults to 1.
 
-`reserve` prints an id and records the calling shell as the owner. `attach` stores the QEMU pid. `release` removes the record. It does not send a signal. `--forget` removes the record while that process is still running, and still does not send a signal. `run` and `sbm-lab run` kill only the pid they started, and they do that when the run returns, times out, or is dropped.
+`reserve` prints an id and records an owner pid. Shell helpers pass that shell's `$$` with `--owner` and `SBM_OWNER_PID`. `hold=$(sbm_reserve ...)` runs in a subshell that exits before `attach`, and `$$` is still the shell that sourced the helper. A helper started as its own process records its parent, because that process exits as soon as `reserve` returns. `attach` stores the QEMU pid and the `ps -o lstart=` value for that pid. `release` removes the record. It does not send a signal. `--forget` removes the record while that process is still running, and still does not send a signal. The helper does not use `--forget` when release says the QEMU pid is still running or that a live owner holds the record. `run` and `sbm-lab run` kill only the pid they started, and only when that pid still has the recorded start time. They do that when the run returns, times out, or is dropped. SIGINT and SIGTERM kill that same pid and then re-raise. On Linux the child is also marked `PR_SET_PDEATHSIG` so it exits if this process is killed without running its Drop.
 
-A reservation whose owner and QEMU pid are both dead is deleted on the next admission. A dead owner with a live QEMU pid is kept and reported as orphaned. That process is not killed.
+A reservation is deleted on the next admission when the owner and the QEMU pid are both dead, or when a recorded start time no longer matches the live pid. A dead owner with a live QEMU pid that still has the recorded start time is kept and reported as orphaned. That process is not killed.
 
 ## Budget
 
 `hw.memsize` on this Mac is 17179869184 bytes (16384 MiB). While `qemu-system-aarch64 -name sbm-builder -m 8192 -smp 4` was running on 2026-11-26, `kern.memorystatus_vm_pressure_level` was 2 and `vm.swapusage` was 1968 MiB used of 3072 MiB. RSS at one sample was about 990 MiB. `sbm-core/scripts/host-resources.sh` records the useful measurement: the guest was idle near 533 MiB and the process still charged about 15 GB of physical footprint. RSS is not the admission number. Each reserved MiB counts as 2 MiB of host RAM.
 
-The host floor is 6144 MiB on a machine with at least 16 GiB, otherwise half of physical RAM. Warning pressure adds 1024 MiB. Swap used past half of the swap file adds 2048 MiB. Critical pressure refuses every new reservation. Guest budget is `(physical - floor) / 2`.
+The host floor is 6144 MiB when physical RAM is at least 15360 MiB, otherwise half of physical RAM. 15360 MiB is the 16 GiB class: `hw.memsize` on this Mac is 16384 MiB, and Linux `MemTotal` for that class of machine is lower. Warning pressure adds 1024 MiB. Swap used past half of the swap file adds 2048 MiB. Critical pressure refuses every new reservation. Unknown pressure does not. Guest budget is `(physical - floor) / 2`.
+
+On Linux the physical number is `MemTotal`. A cgroup `memory.max`, or v1 `memory.limit_in_bytes`, caps it when the limit is smaller. `max` and other unlimited sentinels do not. Pressure is `MemAvailable / MemTotal`: under 10 percent is critical, under 20 percent is warning. Meminfo with no `MemAvailable` line is unknown pressure.
 
 | Host state | Guest budget |
 | --- | --- |
 | 16384 MiB, normal pressure, little swap | 5120 MiB |
+| 15999 MiB, normal pressure, little swap | 4927 MiB |
 | 16384 MiB, warning pressure, swap 1968/3072 | 3584 MiB |
 | critical pressure | 0 |
 
-An existing QEMU process counts even when it has no reservation. Its `-m` value is the guest size. An 8192 MiB guest is already over the 5120 MiB budget, so a new reservation is refused. The ledger does not stop that process.
+An existing QEMU process counts even when it has no reservation. Only a command whose executable basename starts with `qemu-system-` counts, so `sbm-lab resources run -- qemu-system-...` does not count itself. `ps -axww` is used so the command line is not truncated. `-m 4G,slots=2` and `-m size=4G` are 4096 MiB. `-smp cores=4` is 4 vCPU. An 8192 MiB guest is already over the 5120 MiB budget, so a new reservation is refused. The ledger does not stop that process.
 
 ## Workloads
 

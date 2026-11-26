@@ -100,8 +100,14 @@ pub fn firmware_banner(text: &str) -> Option<String> {
             return Some(rest[start + 1..start + 1 + end].to_string());
         }
         if let Some(rest) = line.split("version ").nth(1) {
-            let token = rest.split_whitespace().next().unwrap_or("");
-            if token.starts_with("edk2-") {
+            let token = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|ch: char| matches!(ch, ')' | '(' | ',' | '"'));
+            let ubuntu = line.contains("UEFI firmware")
+                && token.chars().next().is_some_and(|ch| ch.is_ascii_digit());
+            if token.starts_with("edk2-") || ubuntu {
                 return Some(token.to_string());
             }
         }
@@ -156,6 +162,12 @@ mod tests {
         assert_eq!(
             firmware_banner(aarch64).as_deref(),
             Some("edk2-stable202408-prebuilt.qemu.org")
+        );
+        let ubuntu =
+            "UEFI firmware (version 2025.11-3ubuntu7.4 built at 12:58:05 on Oct  8 2026)\n";
+        assert_eq!(
+            firmware_banner(ubuntu).as_deref(),
+            Some("2025.11-3ubuntu7.4")
         );
     }
 }

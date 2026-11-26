@@ -3,7 +3,8 @@
 //! Reservations live in one per-user directory, not in a checkout. Admission
 //! holds an exclusive flock on that directory for the check and the write, so
 //! two agents cannot reserve the same remaining memory. There is no resident
-//! daemon. This process never signals a QEMU pid it did not start.
+//! daemon. This process signals only a QEMU pid it started, and only when
+//! that pid still has the start time recorded at attach.
 
 use crate::error::{Error, Result};
 use crate::profile::{GpuKind, Role};
@@ -13,6 +14,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Once;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +24,12 @@ const SCHEMA: &str = "sbm-lab.resources.v1";
 /// guest and still charged about 15 GB of physical footprint. RSS is not the
 /// admission number. Each reserved MiB counts as this many MiB of host RAM.
 const FOOTPRINT_PER_GUEST_MIB: u64 = 2;
+/// `hw.memsize` on a 16 GiB Mac is 16384 MiB. Linux `MemTotal` for that
+/// class of machine is lower by the kernel reservation, so the same floor
+/// starts at 15 GiB.
+const SIXTEEN_GIB_CLASS_MIB: u64 = 15 * 1024;
+static NOTED_QEMU: AtomicU32 = AtomicU32::new(0);
+static CANCEL_HANDLERS: Once = Once::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -173,6 +182,12 @@ pub struct Reservation {
     pub cpus: u32,
     pub heavy: bool,
     pub created_unix: u64,
+    /// `ps -o lstart=` at reserve time. A live pid with a different start is
+    /// a reuse, not this owner.
+    #[serde(default)]
+    pub owner_start: Option<String>,
+    #[serde(default)]
+    pub qemu_start: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +238,7 @@ pub struct ReservationGuard {
     runtime: PathBuf,
     id: String,
     qemu_pid: Option<u32>,
+    qemu_start: Option<String>,
     release_on_drop: bool,
     kill_on_drop: bool,
 }
@@ -233,8 +249,10 @@ impl ReservationGuard {
     }
 
     pub fn attach_qemu(&mut self, pid: u32) -> Result<()> {
+        let start = attach_pid(&self.runtime, &self.id, pid)?;
         self.qemu_pid = Some(pid);
-        attach_pid(&self.runtime, &self.id, pid)
+        self.qemu_start = start;
+        Ok(())
     }
 }
 
@@ -242,9 +260,11 @@ impl Drop for ReservationGuard {
     fn drop(&mut self) {
         if self.kill_on_drop
             && let Some(pid) = self.qemu_pid
-            && pid != std::process::id()
         {
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            kill_if_same_process(pid, &self.qemu_start);
+            if NOTED_QEMU.load(Ordering::SeqCst) == pid {
+                NOTED_QEMU.store(0, Ordering::SeqCst);
+            }
         }
         if self.release_on_drop {
             let _ = release_id(&self.runtime, &self.id, false);
@@ -319,7 +339,7 @@ pub fn host_floor_mib(
     // 6 GiB is the leftover that still rejected an 8192 MiB guest on the
     // 16 GiB Mac once the 2x footprint was applied. A warning or a half-full
     // swap file raises that floor.
-    let mut floor = if total_mib >= 16384 {
+    let mut floor = if total_mib >= SIXTEEN_GIB_CLASS_MIB {
         6144
     } else {
         total_mib / 2
@@ -365,15 +385,43 @@ pub fn try_admit(
     policy: &Policy,
     req: &AdmitRequest,
 ) -> Result<Reservation> {
+    admit_inner(runtime, view, policy, req, false)
+}
+
+fn try_admit_live(
+    runtime: &Path,
+    view: &HostView,
+    policy: &Policy,
+    req: &AdmitRequest,
+) -> Result<Reservation> {
+    admit_inner(runtime, view, policy, req, true)
+}
+
+fn admit_inner(
+    runtime: &Path,
+    view: &HostView,
+    policy: &Policy,
+    req: &AdmitRequest,
+    refresh_qemu: bool,
+) -> Result<Reservation> {
     fs::create_dir_all(runtime)?;
     let _lock = FileLock::exclusive(&runtime.join("admit.lock"))?;
     let live = load_and_reap(runtime)?;
-    decide(&live, view, policy, req)?;
+    let view = if refresh_qemu {
+        let mut live_view = view.clone();
+        live_view.qemu = read_qemu();
+        live_view
+    } else {
+        view.clone()
+    };
+    decide(&live, &view, policy, req)?;
     let rec = Reservation {
         schema: SCHEMA.into(),
         id: short_id(),
         owner_pid: req.owner_pid,
+        owner_start: process_start_token(req.owner_pid),
         qemu_pid: None,
+        qemu_start: None,
         repo: req.repo.clone(),
         workload: req.workload,
         memory_mib: req.memory_mib,
@@ -396,6 +444,7 @@ pub fn admit_held(
         runtime: runtime.to_path_buf(),
         id: rec.id,
         qemu_pid: None,
+        qemu_start: None,
         release_on_drop: true,
         kill_on_drop: true,
     })
@@ -407,7 +456,7 @@ pub fn admit_retry(req: &AdmitRequest, wait_secs: u64) -> Result<Reservation> {
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
     loop {
         let view = collect_host()?;
-        match try_admit(&runtime, &view, &policy, req) {
+        match try_admit_live(&runtime, &view, &policy, req) {
             Ok(rec) => return Ok(rec),
             Err(_) if wait_secs > 0 && Instant::now() < deadline => {
                 thread::sleep(Duration::from_secs(1));
@@ -431,11 +480,15 @@ pub fn run_reserved(
         runtime: runtime_dir()?,
         id: rec.id,
         qemu_pid: None,
+        qemu_start: None,
         release_on_drop: true,
         kill_on_drop: true,
     };
-    let mut child = Command::new(&command[0]).args(&command[1..]).spawn()?;
+    let mut child_cmd = Command::new(&command[0]);
+    tie_to_parent(&mut child_cmd);
+    let mut child = child_cmd.args(&command[1..]).spawn()?;
     guard.attach_qemu(child.id())?;
+    note_qemu_pid(child.id());
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -459,18 +512,29 @@ pub fn hold_for_run(root: &Path, req: &AdmitRequest) -> Result<ReservationGuard>
         req.repo = root.display().to_string();
     }
     req.owner_pid = std::process::id();
-    admit_held(&runtime, &view, &policy, &req)
+    let rec = try_admit_live(&runtime, &view, &policy, &req)?;
+    Ok(ReservationGuard {
+        runtime,
+        id: rec.id,
+        qemu_pid: None,
+        qemu_start: None,
+        release_on_drop: true,
+        kill_on_drop: true,
+    })
 }
 
 pub fn release_id(runtime: &Path, id: &str, forget: bool) -> Result<()> {
+    check_id(id)?;
     fs::create_dir_all(runtime)?;
     let _lock = FileLock::exclusive(&runtime.join("admit.lock"))?;
     let path = reservation_path(runtime, id);
     let rec = read_reservation(&path).ok_or_else(|| {
         Error::message(format!("no reservation {id} under {}", runtime.display()))
     })?;
-    let owner_alive = pid_alive(rec.owner_pid);
-    let qemu_alive = rec.qemu_pid.is_some_and(pid_alive);
+    let owner_alive = tracked_alive(rec.owner_pid, &rec.owner_start);
+    let qemu_alive = rec
+        .qemu_pid
+        .is_some_and(|pid| tracked_alive(pid, &rec.qemu_start));
     let ours = caller_owns(rec.owner_pid);
     if ours || forget || (!owner_alive && !qemu_alive) {
         let _ = fs::remove_file(path);
@@ -488,7 +552,8 @@ pub fn release_id(runtime: &Path, id: &str, forget: bool) -> Result<()> {
     )))
 }
 
-pub fn attach_pid(runtime: &Path, id: &str, qemu_pid: u32) -> Result<()> {
+pub fn attach_pid(runtime: &Path, id: &str, qemu_pid: u32) -> Result<Option<String>> {
+    check_id(id)?;
     fs::create_dir_all(runtime)?;
     let _lock = FileLock::exclusive(&runtime.join("admit.lock"))?;
     let path = reservation_path(runtime, id);
@@ -501,8 +566,11 @@ pub fn attach_pid(runtime: &Path, id: &str, qemu_pid: u32) -> Result<()> {
             rec.owner_pid
         )));
     }
+    let start = process_start_token(qemu_pid);
     rec.qemu_pid = Some(qemu_pid);
-    store(runtime, &rec)
+    rec.qemu_start = start.clone();
+    store(runtime, &rec)?;
+    Ok(start)
 }
 
 pub fn report(runtime: &Path, view: &HostView, policy: &Policy) -> Result<ResourceReport> {
@@ -586,10 +654,10 @@ fn build_report(
     );
     let mut warnings = Vec::new();
     if view.pressure == Pressure::Warn {
-        warnings.push("macOS memory pressure is warning".into());
+        warnings.push("memory pressure is warning".into());
     }
     if view.pressure == Pressure::Critical {
-        warnings.push("macOS memory pressure is critical; new reservations are refused".into());
+        warnings.push("memory pressure is critical; new reservations are refused".into());
     }
     if view.pressure == Pressure::Unknown {
         warnings.push("memory pressure could not be read".into());
@@ -629,8 +697,10 @@ fn build_report(
         });
     }
     for rec in live {
-        let owner_alive = pid_alive(rec.owner_pid);
-        let qemu_alive = rec.qemu_pid.is_some_and(pid_alive);
+        let owner_alive = tracked_alive(rec.owner_pid, &rec.owner_start);
+        let qemu_alive = rec
+            .qemu_pid
+            .is_some_and(|pid| tracked_alive(pid, &rec.qemu_start));
         if !owner_alive && qemu_alive {
             warnings.push(format!(
                 "reservation {} is orphaned; qemu pid {} is still running and will not be killed",
@@ -778,8 +848,10 @@ fn load_and_reap(runtime: &Path) -> Result<Vec<Reservation>> {
         let Some(rec) = read_reservation(&path) else {
             continue;
         };
-        let owner_alive = pid_alive(rec.owner_pid);
-        let qemu_alive = rec.qemu_pid.is_some_and(pid_alive);
+        let owner_alive = tracked_alive(rec.owner_pid, &rec.owner_start);
+        let qemu_alive = rec
+            .qemu_pid
+            .is_some_and(|pid| tracked_alive(pid, &rec.qemu_start));
         if !owner_alive && !qemu_alive {
             let _ = fs::remove_file(path);
             continue;
@@ -820,6 +892,9 @@ fn reservation_path(runtime: &Path, id: &str) -> PathBuf {
 /// processes, so the owner may be this process, its parent, or the shell that
 /// started a one-line helper such as python.
 pub fn shell_owner_pid() -> u32 {
+    if let Some(pid) = env_owner_pid() {
+        return pid;
+    }
     let parent = parent_of(std::process::id());
     if parent > 1 {
         parent
@@ -828,18 +903,36 @@ pub fn shell_owner_pid() -> u32 {
     }
 }
 
-fn caller_owns(owner: u32) -> bool {
+fn env_owner_pid() -> Option<u32> {
+    let value = std::env::var("SBM_OWNER_PID").ok()?;
+    let pid = value.trim().parse::<u32>().ok()?;
+    (pid > 1).then_some(pid)
+}
+
+/// `hold=$(sbm_reserve)` runs in a subshell that exits before `attach`.
+/// The helper exports `SBM_OWNER_PID=$$`, which stays the script pid.
+pub fn owns_reservation(
+    owner: u32,
+    self_pid: u32,
+    ancestors: &[u32],
+    env_owner: Option<u32>,
+) -> bool {
     if owner == 0 {
         return false;
     }
-    if owner == std::process::id() {
+    if owner == self_pid || env_owner == Some(owner) {
         return true;
     }
+    ancestors
+        .iter()
+        .take(2)
+        .any(|pid| *pid > 1 && *pid == owner)
+}
+
+fn caller_owns(owner: u32) -> bool {
     let parent = parent_of(std::process::id());
-    if owner == parent {
-        return true;
-    }
-    parent > 1 && owner == parent_of(parent)
+    let grand = if parent > 1 { parent_of(parent) } else { 0 };
+    owns_reservation(owner, std::process::id(), &[parent, grand], env_owner_pid())
 }
 
 fn parent_of(pid: u32) -> u32 {
@@ -874,18 +967,13 @@ fn read_total_mib() -> Result<u64> {
         return Ok(bytes / 1024 / 1024);
     }
     let text = fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: u64 = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-            return Ok(kb / 1024);
-        }
+    let info = parse_meminfo(&text)
+        .ok_or_else(|| Error::message("could not read host physical memory"))?;
+    let total = host_mib_from_stats(info.total_kib, cgroup_memory_bytes());
+    if total == 0 {
+        return Err(Error::message("could not read host physical memory"));
     }
-    Err(Error::message("could not read host physical memory"))
+    Ok(total)
 }
 
 fn read_pressure() -> Pressure {
@@ -901,38 +989,7 @@ fn read_pressure() -> Pressure {
             _ => Pressure::Critical,
         };
     }
-    let text = fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let mut total = 0u64;
-    let mut available = 0u64;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            total = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-        }
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            available = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-        }
-    }
-    if total == 0 {
-        return Pressure::Unknown;
-    }
-    let pct = available.saturating_mul(100) / total;
-    if pct < 10 {
-        Pressure::Critical
-    } else if pct < 20 {
-        Pressure::Warn
-    } else {
-        Pressure::Normal
-    }
+    pressure_from_meminfo(&fs::read_to_string("/proc/meminfo").unwrap_or_default())
 }
 
 fn read_swap() -> (u64, u64) {
@@ -943,28 +1000,11 @@ fn read_swap() -> (u64, u64) {
         return parse_swapusage(&text);
     }
     let text = fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let mut total = 0u64;
-    let mut free = 0u64;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("SwapTotal:") {
-            total = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-        }
-        if let Some(rest) = line.strip_prefix("SwapFree:") {
-            free = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("0")
-                .parse()
-                .unwrap_or(0);
-        }
-    }
-    let total_mib = total / 1024;
-    let used_mib = total.saturating_sub(free) / 1024;
+    let Some(info) = parse_meminfo(&text) else {
+        return (0, 0);
+    };
+    let total_mib = info.swap_total_kib / 1024;
+    let used_mib = info.swap_total_kib.saturating_sub(info.swap_free_kib) / 1024;
     (used_mib, total_mib)
 }
 
@@ -981,21 +1021,25 @@ fn read_cpus() -> u32 {
 }
 
 fn read_qemu() -> Vec<RunningQemu> {
-    let Ok(text) = command_stdout("ps", &["-ax", "-o", "pid=,command="]) else {
+    let Ok(text) = command_stdout("ps", &["-axww", "-o", "pid=,command="]) else {
         return Vec::new();
     };
+    let self_pid = std::process::id();
     let mut rows = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         let Some((pid, command)) = line.split_once(char::is_whitespace) else {
             continue;
         };
-        if !command.contains("qemu-system-") {
+        if !command_is_qemu(command) {
             continue;
         }
         let Ok(pid) = pid.trim().parse::<u32>() else {
             continue;
         };
+        if pid == self_pid {
+            continue;
+        }
         let (guest_mib, cpus, memory_known) = parse_guest_spec(command);
         let cwd = process_cwd(pid);
         let repo = repo_hint(command).or_else(|| cwd.as_deref().and_then(repo_hint));
@@ -1012,6 +1056,10 @@ fn read_qemu() -> Vec<RunningQemu> {
 }
 
 fn process_cwd(pid: u32) -> Option<String> {
+    let proc = PathBuf::from(format!("/proc/{pid}/cwd"));
+    if let Ok(path) = fs::read_link(&proc) {
+        return Some(path.to_string_lossy().into_owned());
+    }
     let output = Command::new("/usr/sbin/lsof")
         .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
         .output()
@@ -1037,6 +1085,262 @@ fn command_stdout(bin: &str, args: &[&str]) -> Result<String> {
         return Err(Error::message(format!("{bin} failed")));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+pub struct MemInfo {
+    pub total_kib: u64,
+    pub available_kib: Option<u64>,
+    pub swap_total_kib: u64,
+    pub swap_free_kib: u64,
+}
+
+pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
+    let mut total = None;
+    let mut available = None;
+    let mut saw_available = false;
+    let mut swap_total = 0u64;
+    let mut swap_free = 0u64;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total = Some(kib_field(rest));
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            saw_available = true;
+            available = Some(kib_field(rest));
+        } else if let Some(rest) = line.strip_prefix("SwapTotal:") {
+            swap_total = kib_field(rest);
+        } else if let Some(rest) = line.strip_prefix("SwapFree:") {
+            swap_free = kib_field(rest);
+        }
+    }
+    let total = total.filter(|n| *n > 0)?;
+    Some(MemInfo {
+        total_kib: total,
+        available_kib: saw_available.then_some(available.unwrap_or(0)),
+        swap_total_kib: swap_total,
+        swap_free_kib: swap_free,
+    })
+}
+
+fn kib_field(rest: &str) -> u64 {
+    rest.split_whitespace()
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0)
+}
+
+pub fn pressure_from_meminfo(text: &str) -> Pressure {
+    let Some(info) = parse_meminfo(text) else {
+        return Pressure::Unknown;
+    };
+    let Some(available) = info.available_kib else {
+        return Pressure::Unknown;
+    };
+    let pct = available.saturating_mul(100) / info.total_kib;
+    if pct < 10 {
+        Pressure::Critical
+    } else if pct < 20 {
+        Pressure::Warn
+    } else {
+        Pressure::Normal
+    }
+}
+
+pub fn parse_cgroup_memory(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() || text == "max" {
+        return None;
+    }
+    let bytes: u64 = text.parse().ok()?;
+    if bytes == 0 || bytes >= (1_u64 << 60) {
+        None
+    } else {
+        Some(bytes)
+    }
+}
+
+pub fn host_mib_from_stats(total_kib: u64, cgroup_bytes: Option<u64>) -> u64 {
+    let mut total = total_kib / 1024;
+    if let Some(bytes) = cgroup_bytes {
+        let cap = bytes / 1024 / 1024;
+        if cap > 0 && cap < total {
+            total = cap;
+        }
+    }
+    total
+}
+
+fn cgroup_memory_bytes() -> Option<u64> {
+    let mut best: Option<u64> = None;
+    let mut tighten = |bytes: u64| {
+        if bytes == 0 || bytes >= (1_u64 << 60) {
+            return;
+        }
+        best = Some(best.map(|current| current.min(bytes)).unwrap_or(bytes));
+    };
+    if let Ok(text) = fs::read_to_string("/proc/self/cgroup") {
+        for line in text.lines() {
+            if let Some(path) = line.strip_prefix("0::") {
+                let file = cgroup_file(path, "memory.max");
+                if let Some(bytes) = fs::read_to_string(file)
+                    .ok()
+                    .and_then(|body| parse_cgroup_memory(&body))
+                {
+                    tighten(bytes);
+                }
+            }
+            let mut parts = line.splitn(3, ':');
+            let _id = parts.next();
+            let controllers = parts.next().unwrap_or("");
+            let path = parts.next().unwrap_or("");
+            if controllers.split(',').any(|item| item == "memory") {
+                let file = PathBuf::from("/sys/fs/cgroup/memory")
+                    .join(path.trim_start_matches('/'))
+                    .join("memory.limit_in_bytes");
+                if let Some(bytes) = fs::read_to_string(file)
+                    .ok()
+                    .and_then(|body| parse_cgroup_memory(&body))
+                {
+                    tighten(bytes);
+                }
+            }
+        }
+    }
+    if let Some(bytes) = fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|body| parse_cgroup_memory(&body))
+    {
+        tighten(bytes);
+    }
+    best
+}
+
+fn cgroup_file(path: &str, name: &str) -> PathBuf {
+    if path.is_empty() || path == "/" {
+        PathBuf::from("/sys/fs/cgroup").join(name)
+    } else {
+        PathBuf::from("/sys/fs/cgroup")
+            .join(path.trim_start_matches('/'))
+            .join(name)
+    }
+}
+
+pub fn command_is_qemu(command: &str) -> bool {
+    let exe = command.split_whitespace().next().unwrap_or("");
+    let base = exe.rsplit('/').next().unwrap_or(exe);
+    base.starts_with("qemu-system-")
+}
+
+fn check_id(id: &str) -> Result<()> {
+    let ok = !id.is_empty()
+        && id.len() <= 80
+        && !id.contains("..")
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::message(format!("invalid reservation id {id:?}")))
+    }
+}
+
+fn tracked_alive(pid: u32, started: &Option<String>) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    match started {
+        None => true,
+        Some(expected) => match process_start_token(pid) {
+            Some(got) => got == *expected,
+            None => true,
+        },
+    }
+}
+
+fn process_start_token(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let output = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn kill_if_same_process(pid: u32, started: &Option<String>) {
+    if pid <= 1 || pid == std::process::id() || !pid_alive(pid) {
+        return;
+    }
+    let same = match started {
+        Some(expected) => process_start_token(pid).as_ref() == Some(expected),
+        None => parent_of(pid) == std::process::id(),
+    };
+    if same {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+}
+
+extern "C" fn cancel_qemu(sig: libc::c_int) {
+    let pid = NOTED_QEMU.load(Ordering::SeqCst);
+    if pid > 1 {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+pub fn install_cancel_handlers() {
+    CANCEL_HANDLERS.call_once(|| unsafe {
+        libc::signal(libc::SIGINT, cancel_qemu as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            cancel_qemu as *const () as libc::sighandler_t,
+        );
+    });
+}
+
+pub fn note_qemu_pid(pid: u32) {
+    NOTED_QEMU.store(pid, Ordering::SeqCst);
+}
+
+pub fn tie_to_parent(command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                let rc = unsafe {
+                    libc::prctl(
+                        libc::PR_SET_PDEATHSIG,
+                        libc::SIGKILL as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                    )
+                };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if unsafe { libc::getppid() } == 1 {
+                    unsafe { libc::raise(libc::SIGKILL) };
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = command;
+    }
 }
 
 pub fn parse_swapusage(text: &str) -> (u64, u64) {
@@ -1092,7 +1396,8 @@ pub fn parse_guest_spec(command: &str) -> (u32, u32, bool) {
 }
 
 fn parse_memory_mib(token: &str) -> u32 {
-    let token = token.trim();
+    let token = token.split(',').next().unwrap_or(token).trim();
+    let token = token.strip_prefix("size=").unwrap_or(token);
     if token.ends_with(['G', 'g']) {
         let number = &token[..token.len() - 1];
         return number.parse::<u32>().unwrap_or(0).saturating_mul(1024);
@@ -1110,12 +1415,36 @@ fn parse_smp(token: &str) -> Option<u32> {
     {
         return Some(n.max(1));
     }
+    let mut cpus = None;
+    let mut cores = None;
+    let mut threads = None;
+    let mut sockets = None;
     for piece in token.split(',') {
-        if let Some(value) = piece.strip_prefix("cpus=")
-            && let Ok(n) = value.parse::<u32>()
-        {
-            return Some(n.max(1));
+        let Some((key, value)) = piece.split_once('=') else {
+            continue;
+        };
+        let Ok(n) = value.parse::<u32>() else {
+            continue;
+        };
+        match key {
+            "cpus" => cpus = Some(n),
+            "cores" => cores = Some(n),
+            "threads" => threads = Some(n),
+            "sockets" => sockets = Some(n),
+            _ => {}
         }
+    }
+    if let Some(n) = cpus {
+        return Some(n.max(1));
+    }
+    if cores.is_some() || threads.is_some() || sockets.is_some() {
+        return Some(
+            cores
+                .unwrap_or(1)
+                .saturating_mul(threads.unwrap_or(1))
+                .saturating_mul(sockets.unwrap_or(1))
+                .max(1),
+        );
     }
     None
 }
@@ -1201,6 +1530,8 @@ mod tests {
         assert_eq!(guest_budget_mib(16384, Pressure::Normal, 0, 0), 5120);
         assert_eq!(guest_budget_mib(16384, Pressure::Warn, 1968, 3072), 3584);
         assert_eq!(guest_budget_mib(16384, Pressure::Critical, 0, 0), 0);
+        assert_eq!(host_floor_mib(15999, Pressure::Normal, 0, 0), 6144);
+        assert!(guest_budget_mib(15999, Pressure::Normal, 0, 0) >= 4096);
         let (used, total) =
             parse_swapusage("total = 3072.00M  used = 1967.75M  free = 1104.25M  (encrypted)");
         assert_eq!(total, 3072);
@@ -1224,6 +1555,18 @@ mod tests {
             parse_guest_spec("qemu-system-x86_64 -m 4G -smp cpus=2").0,
             4096
         );
+        assert_eq!(
+            parse_guest_spec("qemu-system-x86_64 -m 4G,slots=2 -smp cores=4"),
+            (4096, 4, true)
+        );
+        assert_eq!(
+            parse_guest_spec("qemu-system-aarch64 -m size=4G,slots=2 -smp cores=2,threads=2"),
+            (4096, 4, true)
+        );
+        assert!(command_is_qemu("/usr/bin/qemu-system-aarch64 -m 1024"));
+        assert!(!command_is_qemu(
+            "/usr/local/bin/sbm-lab resources run -- qemu-system-aarch64 -m 8192"
+        ));
     }
 
     #[test]
@@ -1312,6 +1655,8 @@ mod tests {
             cpus: 1,
             heavy: false,
             created_unix: 1,
+            owner_start: None,
+            qemu_start: None,
         };
         store(&dir, &stale).unwrap();
         try_admit(
@@ -1345,6 +1690,8 @@ mod tests {
             cpus: 4,
             heavy: true,
             created_unix: 1,
+            owner_start: None,
+            qemu_start: None,
         };
         store(&dir, &rec).unwrap();
         let err = release_id(&dir, "foreign-vm", false).unwrap_err();
@@ -1433,5 +1780,110 @@ mod tests {
             }
             Err(_) => std::process::exit(2),
         }
+    }
+
+    #[test]
+    fn shell_owner_env_counts_as_the_caller() {
+        assert!(owns_reservation(40, 10, &[20, 30], Some(40)));
+        assert!(owns_reservation(20, 10, &[20, 30], None));
+        assert!(owns_reservation(30, 10, &[20, 30], None));
+        assert!(!owns_reservation(99, 10, &[20, 30], None));
+        assert!(!owns_reservation(0, 10, &[20, 30], None));
+    }
+
+    #[test]
+    fn linux_meminfo_does_not_treat_a_missing_available_as_critical() {
+        let quiet =
+            "MemTotal: 16384532 kB\nMemAvailable: 14000000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n";
+        assert_eq!(pressure_from_meminfo(quiet), Pressure::Normal);
+        assert_eq!(
+            pressure_from_meminfo("MemTotal: 8000000 kB\n"),
+            Pressure::Unknown
+        );
+        assert_eq!(
+            pressure_from_meminfo("MemTotal: 8000000 kB\nMemAvailable: 400000 kB\n"),
+            Pressure::Critical
+        );
+        assert_eq!(
+            pressure_from_meminfo("MemTotal: 10000 kB\nMemAvailable: 1500 kB\n"),
+            Pressure::Warn
+        );
+        assert_eq!(host_mib_from_stats(16_382_976, None), 15999);
+        assert_eq!(
+            host_mib_from_stats(16_382_976, Some(2 * 1024 * 1024 * 1024)),
+            2048
+        );
+        assert_eq!(parse_cgroup_memory("max"), None);
+        assert_eq!(parse_cgroup_memory("2147483648"), Some(2_147_483_648));
+    }
+
+    #[test]
+    fn two_admits_in_one_process_keep_distinct_files() {
+        let dir = test_scratch("ids");
+        let view = quiet(65536);
+        let rules = Policy {
+            max_concurrent: 4,
+            max_heavy: 1,
+        };
+        let first = try_admit(&dir, &view, &rules, &request(Workload::Efi, 1024)).unwrap();
+        let second = try_admit(&dir, &view, &rules, &request(Workload::Efi, 1024)).unwrap();
+        assert_ne!(first.id, second.id);
+        assert!(reservation_path(&dir, &first.id).exists());
+        assert!(reservation_path(&dir, &second.id).exists());
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_the_recorded_owner() {
+        let dir = test_scratch("reused");
+        let mut sleeper = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = sleeper.id();
+        let rec = Reservation {
+            schema: SCHEMA.into(),
+            id: "reused-owner".into(),
+            owner_pid: pid,
+            qemu_pid: Some(pid),
+            repo: "old".into(),
+            workload: Workload::Efi,
+            memory_mib: 1024,
+            cpus: 1,
+            heavy: false,
+            created_unix: 1,
+            owner_start: Some("Thu Jan 1 00:00:00 1970".into()),
+            qemu_start: Some("Thu Jan 1 00:00:00 1970".into()),
+        };
+        store(&dir, &rec).unwrap();
+        let live = load_and_reap(&dir).unwrap();
+        assert!(live.is_empty(), "{live:?}");
+        assert!(!reservation_path(&dir, "reused-owner").exists());
+        assert!(pid_alive(pid));
+        kill_if_same_process(pid, &Some("Thu Jan 1 00:00:00 1970".into()));
+        assert!(pid_alive(pid));
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    #[test]
+    fn reservation_ids_cannot_escape_the_ledger() {
+        let dir = test_scratch("id");
+        let err = release_id(&dir, "../secret", false).unwrap_err();
+        assert!(err.to_string().contains("invalid"), "{err}");
+    }
+
+    #[test]
+    fn unknown_pressure_admits_and_critical_pressure_does_not() {
+        let dir = test_scratch("pressure");
+        let mut unknown = quiet(16384);
+        unknown.pressure = Pressure::Unknown;
+        try_admit(&dir, &unknown, &policy(), &request(Workload::Efi, 1024)).unwrap();
+        let mut critical = quiet(16384);
+        critical.pressure = Pressure::Critical;
+        let err =
+            try_admit(&dir, &critical, &policy(), &request(Workload::Linux, 2048)).unwrap_err();
+        assert!(err.to_string().contains("critical"), "{err}");
     }
 }

@@ -47,7 +47,7 @@ sbm-lab setup --secure-boot
 sbm-lab test --tier secure
 ```
 
-This tier is not part of `smoke` or `product`. It enrolls the lab development keys and checks three boots: the signed probe launches, the unsigned probe is denied, and a signed probe with one flipped byte is denied. The denial string observed on 2026-11-26 was `Access Denied`.
+This tier is not part of `smoke` or `product`. It enrolls the lab development keys and checks three boots: the signed probe launches, the unsigned probe is denied, and a signed probe with one flipped byte is denied. The denial string observed on 2026-11-26 was `Access Denied`. Ubuntu OVMF can print that line without an `edk2-` banner. The scenario passes when `efi-launched` is forbidden and the serial contains `Access Denied` or `Security Violation`. The generic `guest did not emit efi-launched` result does not keep that scenario failed.
 
 ## Builder
 
@@ -68,4 +68,4 @@ The guest must print `SBM-LAB-MARKER:build-vm-ready`. The cloud image's hash is 
 
 ## CI
 
-GitHub Actions runs fmt, clippy, and unit tests, then three QEMU jobs on `ubuntu-latest`: smoke, product, and secure. Missing `/dev/kvm` is not a failure. x86 uses KVM when the device opens and TCG otherwise. aarch64 on an x86 runner is TCG. A guest architecture that does not match the host gets a timeout of at least 720 seconds. The product job checks out `sbm-uefi` at `sbm-uefi-src` so it can boot the published EFI artifacts. A failed job uploads the serial log, QEMU stderr, and `result.json`.
+GitHub Actions runs fmt, clippy, and unit tests, then three QEMU jobs on `ubuntu-latest`: smoke, product, and secure. Missing `/dev/kvm` is not a failure. x86 uses KVM when the device opens and TCG otherwise. aarch64 on an x86 runner is TCG and uses `-cpu cortex-a57`. Same-architecture TCG stays on `-cpu max`. A guest architecture that does not match the host gets a timeout of at least 720 seconds. The product job checks out `sbm-uefi` at `sbm-uefi-src` so it can boot the published EFI artifacts. A failed job uploads the serial log, QEMU stderr, and `result.json`.

@@ -28,30 +28,52 @@ sbm_lab_bin() {
     return 1
 }
 
+# `hold=$(sbm_reserve ...)` runs in a subshell. `$$` stays the sourcing shell.
+# A direct `sbm-resources.sh reserve` process exits immediately, so its parent
+# is the owner that will attach later.
+sbm_owner_pid() {
+    if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+        printf '%s\n' "$PPID"
+    else
+        printf '%s\n' "$$"
+    fi
+}
+
 sbm_reserve() {
     local workload=$1 memory=$2 cpus=$3 repo=$4
-    local bin
+    local bin owner
     bin=$(sbm_lab_bin) || return 1
-    "$bin" resources reserve --workload "$workload" --memory "$memory" --cpus "$cpus" --repo "$repo"
+    owner=$(sbm_owner_pid)
+    SBM_OWNER_PID="$owner" "$bin" resources reserve \
+        --workload "$workload" --memory "$memory" --cpus "$cpus" --repo "$repo" \
+        --owner "$owner"
 }
 
 sbm_attach() {
     local id=$1 pid=$2
-    local bin
+    local bin owner
     bin=$(sbm_lab_bin) || return 1
-    "$bin" resources attach --id "$id" --pid "$pid"
+    owner=$(sbm_owner_pid)
+    SBM_OWNER_PID="$owner" "$bin" resources attach --id "$id" --pid "$pid"
 }
 
 sbm_release() {
     local id=$1
-    local bin
+    local bin owner err
     bin=$(sbm_lab_bin) || return 1
-    if "$bin" resources release --id "$id"; then
+    owner=$(sbm_owner_pid)
+    if err=$(SBM_OWNER_PID="$owner" "$bin" resources release --id "$id" 2>&1); then
         return 0
     fi
-    # The owner shell may already have exited. --forget drops the record and
-    # does not signal the process.
-    "$bin" resources release --id "$id" --forget
+    printf '%s\n' "$err" >&2
+    case "$err" in
+        *"does not kill"*|*"owned by"*)
+            return 1
+            ;;
+    esac
+    # The record can outlive a shell that exited before attach. --forget still
+    # does not signal a process.
+    SBM_OWNER_PID="$owner" "$bin" resources release --id "$id" --forget
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

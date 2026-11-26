@@ -13,7 +13,7 @@ use crate::resources::{
     AdmitRequest, Policy, Workload, admit_retry, attach_pid, clamp_launch, collect_host,
     release_id, report, run_reserved, runtime_dir, shell_owner_pid, status_text,
 };
-use crate::run::{RunOptions, ScenarioCheck, execute_run, probe_efi, scenario_passed};
+use crate::run::{RunOptions, ScenarioCheck, apply_scenario, execute_run, probe_efi};
 use crate::secureboot::enroll;
 use crate::util::{lab_root, sha256_file, which};
 use clap::{Parser, Subcommand};
@@ -182,6 +182,9 @@ enum ResourceCmd {
         memory: Option<u32>,
         #[arg(long)]
         cpus: Option<u32>,
+        /// Process that owns the reservation. Shell helpers pass `$$`.
+        #[arg(long)]
+        owner: Option<u32>,
         /// Retry for this many seconds instead of refusing immediately.
         #[arg(long, default_value_t = 0)]
         wait: u64,
@@ -624,8 +627,8 @@ fn run_scenario(
         crate::profile::ScreenshotMode::Qmp => "qmp",
         crate::profile::ScreenshotMode::Any => "any",
     };
-    if let Err(err) = scenario_passed(
-        &report,
+    Ok(apply_scenario(
+        report,
         &ScenarioCheck {
             expect: &scenario.expect,
             require: &scenario.require_paths,
@@ -637,17 +640,7 @@ fn run_scenario(
             serial_contains_any: &scenario.serial_contains_any,
             reset_after: scenario.reset_after.as_deref(),
         },
-    ) {
-        let mut failed = report;
-        let previous = failed.failure_reason.clone();
-        failed.success = false;
-        failed.failure_reason = Some(match previous {
-            Some(previous) if !previous.is_empty() => format!("{previous}; {err}"),
-            _ => err.to_string(),
-        });
-        return Ok(failed);
-    }
-    Ok(report)
+    ))
 }
 
 fn base_opts(profile: crate::profile::Profile, timeout: u64) -> RunOptions {
@@ -939,18 +932,30 @@ fn setup_build_vm(root: &Path) -> Result<()> {
 fn stop_lab_processes(root: &Path) -> Result<()> {
     let marker = root.join("var/runs");
     let marker = marker.display().to_string();
+    let self_pid = std::process::id();
     let output = Command::new("ps")
-        .args(["-ax", "-o", "pid=,command="])
+        .args(["-axww", "-o", "pid=,command="])
         .output()?;
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines() {
         if !line.contains(&marker) {
             continue;
         }
-        let mut parts = line.split_whitespace();
-        if let Some(pid) = parts.next().and_then(|p| p.parse::<i32>().ok()) {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+        let Some((pid_text, command)) = line.trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Some(pid) = pid_text.trim().parse::<i32>().ok() else {
+            continue;
+        };
+        if pid as u32 == self_pid {
+            continue;
         }
+        let exe = command.split_whitespace().next().unwrap_or("");
+        let base = exe.rsplit('/').next().unwrap_or(exe);
+        if !base.starts_with("qemu-system-") {
+            continue;
+        }
+        unsafe { libc::kill(pid, libc::SIGTERM) };
     }
     Ok(())
 }
@@ -986,10 +991,11 @@ fn resources_main(json_out: bool, action: &ResourceCmd) -> Result<i32> {
             repo,
             memory,
             cpus,
+            owner,
             wait,
         } => {
             let mut req = admit_request(workload, repo, *memory, *cpus)?;
-            req.owner_pid = shell_owner_pid();
+            req.owner_pid = owner.unwrap_or_else(shell_owner_pid);
             let rec = admit_retry(&req, *wait)?;
             if json_out {
                 println!("{}", serde_json::to_string_pretty(&rec)?);

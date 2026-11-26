@@ -12,7 +12,9 @@ use crate::product::build_menu_disk;
 use crate::profile::{BootKind, NetworkMode, Profile, Role};
 use crate::proxy::DelayProxy;
 use crate::qmp::Qmp;
-use crate::resources::{AdmitRequest, clamp_launch, hold_for_run, workload_for};
+use crate::resources::{
+    AdmitRequest, clamp_launch, hold_for_run, note_qemu_pid, tie_to_parent, workload_for,
+};
 use crate::util::{
     FileLock, env_u32, pe_machine, reject_host_device, sha256_file, short_id, which, write_file,
 };
@@ -349,6 +351,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
     let plan = LaunchPlan {
         bin: qemu_bin.clone(),
         arch,
+        host_arch: facts.arch.clone(),
         accel: choice.accel,
         machine,
         memory_mib: memory,
@@ -390,13 +393,16 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
     let stdout = File::create(run_dir.join("qemu.stdout"))?;
     let stderr_path = run_dir.join("qemu.stderr");
     let stderr = File::create(&stderr_path)?;
-    let mut child = Command::new(&qemu_bin)
+    let mut command = Command::new(&qemu_bin);
+    tie_to_parent(&mut command);
+    let mut child = command
         .args(&argv)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()?;
     budget.attach_qemu(child.id())?;
+    note_qemu_pid(child.id());
     let started = Instant::now();
     let mut failure = None;
     let timeout_secs = effective_timeout(&facts.arch, arch, opts.timeout_secs);
@@ -1072,6 +1078,37 @@ pub struct ScenarioCheck<'a> {
     pub reset_after: Option<&'a str>,
 }
 
+/// Scenario assertions are the contract for `sbm-lab test`. A denial
+/// scenario passes when Secure Boot prints `Access Denied` and the probe
+/// never emits `efi-launched`. That serial has no `edk2-` banner on Ubuntu
+/// OVMF, so the generic launch check must not keep the run failed.
+pub fn apply_scenario(mut report: RunReport, check: &ScenarioCheck<'_>) -> RunReport {
+    match scenario_passed(&report, check) {
+        Ok(()) => {
+            let generic =
+                report.failure_reason.as_deref() == Some("guest did not emit efi-launched");
+            let expects_launch = check
+                .expect
+                .iter()
+                .any(|name| name == "efi-launched" || name.starts_with("efi-launched "));
+            if generic && !expects_launch {
+                report.success = true;
+                report.failure_reason = None;
+            }
+            report
+        }
+        Err(err) => {
+            let previous = report.failure_reason.clone();
+            report.success = false;
+            report.failure_reason = Some(match previous {
+                Some(previous) if !previous.is_empty() => format!("{previous}; {err}"),
+                _ => err.to_string(),
+            });
+            report
+        }
+    }
+}
+
 pub fn scenario_passed(report: &RunReport, check: &ScenarioCheck<'_>) -> Result<()> {
     let ScenarioCheck {
         expect,
@@ -1205,4 +1242,83 @@ fn evidence(report: &RunReport) -> String {
         log_tail(&serial, 12),
         log_tail(&stderr, 8)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunReport, SafetyReport, ScenarioCheck, apply_scenario};
+    use std::fs;
+
+    fn denied(serial: &std::path::Path, reason: Option<&str>) -> RunReport {
+        RunReport {
+            schema: "sbm-lab.run/v1",
+            id: "deny".into(),
+            profile: "secure".into(),
+            success: false,
+            failure_reason: reason.map(str::to_string),
+            arch: "x86_64".into(),
+            accel: "tcg".into(),
+            execution_class: "emulated".into(),
+            representative_of_physical_hardware: false,
+            execution_note: String::new(),
+            firmware_banner: None,
+            markers: Vec::new(),
+            boot_targets: Vec::new(),
+            screenshot: None,
+            guest_screenshot: None,
+            serial_log: serial.display().to_string(),
+            duration_ms: 1,
+            stages_ms: Default::default(),
+            qemu_argv: Vec::new(),
+            safety: SafetyReport {
+                backing_hashes_unchanged: true,
+                firmware_code_unchanged: true,
+                firmware_template_unchanged: true,
+                physical_disks_passed_through: false,
+            },
+            kept: true,
+            run_dir: serial.parent().unwrap().display().to_string(),
+            payload_class: None,
+        }
+    }
+
+    #[test]
+    fn access_denied_without_a_firmware_banner_passes_a_denial_scenario() {
+        let dir = std::env::temp_dir().join(format!("sbm-deny-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let serial = dir.join("serial.log");
+        fs::write(
+            &serial,
+            "BdsDxe: failed to load Boot0002 ... Access Denied -- rejected probably by Secure Boot\n",
+        )
+        .unwrap();
+        let check = ScenarioCheck {
+            expect: &[],
+            require: &[],
+            forbid: &[],
+            serial_contains: &[],
+            mode: "markers",
+            screenshot: "off",
+            forbid_markers: &["efi-launched".into()],
+            serial_contains_any: &["Access Denied".into(), "Security Violation".into()],
+            reset_after: None,
+        };
+        let report = apply_scenario(
+            denied(&serial, Some("guest did not emit efi-launched")),
+            &check,
+        );
+        assert!(report.success, "{:?}", report.failure_reason);
+        assert!(report.failure_reason.is_none());
+
+        let still = apply_scenario(
+            denied(&serial, Some("guest did not emit efi-launched")),
+            &ScenarioCheck {
+                expect: &["efi-launched".into()],
+                ..check
+            },
+        );
+        assert!(!still.success);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

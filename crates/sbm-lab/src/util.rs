@@ -158,13 +158,15 @@ pub fn reject_host_device(path: &Path) -> Result<()> {
 }
 
 pub fn short_id() -> String {
-    let secs = SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let mix = secs.wrapping_mul(0x9E37) ^ u64::from(pid);
-    format!("{secs:x}-{pid}-{mix:04x}")
+    format!("{nanos:x}-{pid:x}-{seq:x}")
 }
 
 pub fn env_u32(name: &str, default: u32) -> u32 {

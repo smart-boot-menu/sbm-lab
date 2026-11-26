@@ -17,6 +17,7 @@ pub struct AttachedDisk {
 pub struct LaunchPlan {
     pub bin: PathBuf,
     pub arch: Arch,
+    pub host_arch: String,
     pub accel: Accel,
     pub machine: String,
     pub memory_mib: u32,
@@ -70,7 +71,7 @@ pub fn qemu_args(plan: &LaunchPlan) -> Result<Vec<String>> {
     args.push("-accel".into());
     args.push(plan.accel.as_str().into());
     args.push("-cpu".into());
-    args.push(cpu_model(plan.accel, plan.arch).into());
+    args.push(cpu_model(plan.accel, plan.arch, &plan.host_arch).into());
     args.push("-m".into());
     args.push(plan.memory_mib.to_string());
     args.push("-smp".into());
@@ -237,6 +238,7 @@ mod tests {
         LaunchPlan {
             bin: PathBuf::from("qemu"),
             arch,
+            host_arch: "aarch64".into(),
             accel,
             machine: if arch == Arch::Aarch64 {
                 "virt".into()
@@ -284,6 +286,16 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["-accel", "hvf"]));
         assert!(args.windows(2).any(|w| w == ["-cpu", "host"]));
         assert!(args.iter().any(|a| a == "ramfb"));
+    }
+
+    #[test]
+    fn aarch64_tcg_on_x86_uses_cortex_a57() {
+        let mut p = plan(Arch::Aarch64, Accel::Tcg);
+        p.host_arch = "x86_64".into();
+        p.code = Some(PathBuf::from("/usr/share/AAVMF/AAVMF_CODE.no-secboot.fd"));
+        let args = qemu_args(&p).unwrap();
+        assert!(args.windows(2).any(|w| w == ["-cpu", "cortex-a57"]));
+        assert!(!args.iter().any(|a| a == "max"));
     }
 
     #[test]
