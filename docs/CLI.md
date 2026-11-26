@@ -159,4 +159,17 @@ The same text is written to `EFI/sbm-lab/result.txt` on the probe disk. The harn
 
 ## Resource limits
 
-`SBM_LAB_MAX_CONCURRENT` defaults to 2. Extra runs wait on `var/runs/.slot-N`. A slot whose recorded pid is dead is reused. `SBM_LAB_FIRMWARE` adds a firmware directory searched before the system QEMU paths.
+`sbm-lab run` and `sbm-lab test` take a reservation from the shared ledger before QEMU starts. The per-checkout slot files under `var/runs/.slot-N` still cap how many runs one checkout starts (`SBM_LAB_MAX_CONCURRENT`, default 2). They do not see another repo. The shared ledger does. `SBM_LAB_FIRMWARE` adds a firmware directory searched before the system QEMU paths.
+
+```bash
+sbm-lab resources status
+sbm-lab resources doctor
+sbm-lab resources reserve --workload efi --memory 1024 --cpus 1 --repo "$PWD"
+sbm-lab resources attach --id ID --pid PID
+sbm-lab resources release --id ID
+sbm-lab resources run --workload linux --memory 2048 --cpus 2 --timeout 75 -- qemu-system-aarch64 ...
+```
+
+`doctor` exits 1 when memory pressure is critical, guest RAM is over the budget, a reservation is orphaned, or a QEMU process has no reservation. `status` always exits 0. `reserve` prints the id. `release` deletes that record and does not signal QEMU. `--forget` deletes it while the process is still running. `run` kills only the command it started.
+
+The ledger is `~/Library/Application Support/sbm-lab` on macOS and `$XDG_STATE_HOME/sbm-lab` elsewhere. `SBM_LAB_RUNTIME` overrides it. Details, the measured budget, and the launchers that used to skip the lab are in [RESOURCES.md](RESOURCES.md).

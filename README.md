@@ -10,6 +10,7 @@ Installer ISO boots stay in `sbm-catalog/tools/boot-installer.sh`. This harness 
 
 ```bash
 cargo run -p sbm-lab -- doctor
+cargo run -p sbm-lab -- resources status
 cargo run -p sbm-lab -- setup
 cargo run -p sbm-lab -- list
 cargo run -p sbm-lab -- run aarch64-uefi --efi path/to/app.efi

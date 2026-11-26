@@ -15,6 +15,7 @@ pub mod product;
 pub mod profile;
 pub mod proxy;
 pub mod qmp;
+pub mod resources;
 pub mod run;
 pub mod secureboot;
 pub mod util;

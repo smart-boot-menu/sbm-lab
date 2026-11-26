@@ -12,6 +12,7 @@ use crate::product::build_menu_disk;
 use crate::profile::{BootKind, NetworkMode, Profile, Role};
 use crate::proxy::DelayProxy;
 use crate::qmp::Qmp;
+use crate::resources::{AdmitRequest, clamp_launch, hold_for_run, workload_for};
 use crate::util::{
     FileLock, env_u32, pe_machine, reject_host_device, sha256_file, short_id, which, write_file,
 };
@@ -110,14 +111,32 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
     let secure = opts.secure_boot.unwrap_or(opts.profile.secure_boot);
     let tpm = opts.tpm.unwrap_or(opts.profile.tpm);
     let network = opts.network.unwrap_or(opts.profile.network);
-    let memory = opts
+    let requested_memory = opts
         .memory_mib
         .unwrap_or(opts.profile.memory_mib)
         .min(env_u32("SBM_LAB_MAX_MEMORY_MIB", 8192));
-    let cpus = opts
+    let requested_cpus = opts
         .cpus
         .unwrap_or(opts.profile.cpus)
         .clamp(1, env_u32("SBM_LAB_MAX_CPUS", 4));
+    let workload = workload_for(opts.profile.role, opts.profile.gpu, opts.graphical);
+    let (memory, cpus) = clamp_launch(
+        workload,
+        requested_memory,
+        requested_cpus,
+        opts.memory_mib.is_some(),
+        opts.cpus.is_some(),
+    )?;
+    let mut budget = hold_for_run(
+        root,
+        &AdmitRequest {
+            owner_pid: 0,
+            repo: root.display().to_string(),
+            workload,
+            memory_mib: memory,
+            cpus,
+        },
+    )?;
     let qemu_name = arch.qemu_binary();
     let qemu_bin =
         which(qemu_name).ok_or_else(|| Error::message(format!("{qemu_name} is not installed")))?;
@@ -377,6 +396,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()?;
+    budget.attach_qemu(child.id())?;
     let started = Instant::now();
     let mut failure = None;
     let timeout_secs = effective_timeout(&facts.arch, arch, opts.timeout_secs);

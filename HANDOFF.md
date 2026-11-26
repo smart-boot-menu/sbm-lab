@@ -52,6 +52,14 @@ Build VM `6b0897eb-42774-42264c9b0a6b`: aarch64 HVF, 16401 ms, marker `build-vm-
 
 GitHub Actions run 45879871319 failed in the smoke job. x86_64 passed. `aarch64-efi-launch` and `aarch64-chainload` each ran to the 240 s timeout and reported `missing marker efi-launched`. On an x86 runner that guest is TCG. A cross-architecture boot now uses at least 720 s. The probe disk also contains `startup.nsh`, so a drop to the UEFI shell still starts the boot file. A failed smoke job uploads `serial.log`, `debugcon.log`, `qemu.stderr`, and `result.json`.
 
+## Host resources
+
+`sbm-lab resources` is the shared admission check for QEMU. The ledger is `~/Library/Application Support/sbm-lab` (`SBM_LAB_RUNTIME` overrides it), with an exclusive flock around each reserve. It is not a daemon. `resources release` does not signal QEMU. A guard inside `sbm-lab run` kills only the QEMU pid that run started.
+
+On 2026-11-26 this Mac had 16384 MiB of physical RAM. While an 8192 MiB `qemu-system-aarch64 -name sbm-builder` was up, `kern.memorystatus_vm_pressure_level` was 2 and swap was 1968 of 3072 MiB. `sbm-core/scripts/host-resources.sh` records that the guest was idle near 533 MiB and the process still charged about 15 GB of physical footprint. The budget therefore counts each guest MiB twice and keeps at least 6 GiB for macOS. On a quiet 16 GiB host that leaves 5120 MiB of guest RAM. Warning pressure plus a half-full swap file leaves 3584 MiB. An 8192 MiB guest does not fit. EFI reservations are capped at 1024 MiB and 1 vCPU. The build workload stays at the 4096 MiB / 4 vCPU size that `linux-dev` already booted, with a 6144 MiB cap. Heavy workloads (graphical, build, ram) admit one at a time.
+
+`sbm-lab run` reserves before it spawns QEMU. These launchers did not, and now call the same ledger: `sbm-uefi/crates/xtask/src/qemu.rs` (1024 MiB, 1 vCPU), `sbm-core/scripts/boot-smoke.sh`, `sbm-core/scripts/start-builder.sh`, `sbm-catalog/tools/boot-installer.sh` (2048 MiB, 2 vCPU), and `sbm-as/scripts/uboot-efi-poc.sh` (1024 MiB, 1 vCPU). `install` has no QEMU launcher. A QEMU command typed by hand is still invisible until `resources status` sees the process; it counts against the budget and is not killed.
+
 ## Isolation
 
 Each run has its own directory under `var/runs/<id>`, its own variable-store copy, and its own qcow2 overlays. `var/fixtures/.lock` is an exclusive flock around fixture creation. Paths under `/dev`, block devices, and paths that contain a comma are rejected. Two agents should still use separate checkouts or `SBM_LAB_ROOT` if they need separate firmware and key directories. The enrolled Secure Boot keys live only in `var/secure-boot`.

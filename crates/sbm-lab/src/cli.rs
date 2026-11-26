@@ -9,6 +9,10 @@ use crate::product::{find_core_uki, find_menu};
 use crate::profile::{
     BootKind, NetworkMode, ScenarioMode, Tier, find_profile, load_profiles, load_scenarios,
 };
+use crate::resources::{
+    AdmitRequest, Policy, Workload, admit_retry, attach_pid, clamp_launch, collect_host,
+    release_id, report, run_reserved, runtime_dir, shell_owner_pid, status_text,
+};
 use crate::run::{RunOptions, ScenarioCheck, execute_run, probe_efi, scenario_passed};
 use crate::secureboot::enroll;
 use crate::util::{lab_root, sha256_file, which};
@@ -155,6 +159,67 @@ enum CommandKind {
         #[command(subcommand)]
         action: ArtifactCmd,
     },
+    /// Share one memory budget across SBM checkouts.
+    Resources {
+        #[command(subcommand)]
+        action: ResourceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResourceCmd {
+    /// Show host memory, reservations, and QEMU processes.
+    Status,
+    /// Exit 1 when the host cannot safely admit another managed VM.
+    Doctor,
+    /// Reserve guest RAM. Prints the reservation id.
+    Reserve {
+        #[arg(long)]
+        workload: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long)]
+        memory: Option<u32>,
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// Retry for this many seconds instead of refusing immediately.
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+    },
+    /// Drop a reservation. Does not signal QEMU.
+    Release {
+        #[arg(long)]
+        id: String,
+        /// Remove the record even if its QEMU process is still running.
+        #[arg(long)]
+        forget: bool,
+    },
+    /// Record the QEMU pid for a reservation this process owns.
+    Attach {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        pid: u32,
+    },
+    /// Reserve, run a command, then release. The command's pid is the one that gets killed if this process is cancelled.
+    #[command(trailing_var_arg = true)]
+    Run {
+        #[arg(long)]
+        workload: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long)]
+        memory: Option<u32>,
+        #[arg(long)]
+        cpus: Option<u32>,
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+        /// Kill the command after this many seconds. 0 waits until it exits.
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -172,6 +237,9 @@ enum ArtifactCmd {
 
 pub fn execute() -> Result<i32> {
     let cli = Cli::parse();
+    if let CommandKind::Resources { action } = &cli.command {
+        return resources_main(cli.json, action);
+    }
     let root = lab_root(cli.root.as_deref())?;
     match cli.command {
         CommandKind::Doctor => {
@@ -382,6 +450,9 @@ pub fn execute() -> Result<i32> {
                 }
             };
             run_one(&root, id, None, 180, cli.json)
+        }
+        CommandKind::Resources { .. } => {
+            unreachable!("resources is handled before lab root lookup")
         }
         CommandKind::Artifacts { action } => match action {
             ArtifactCmd::Scan => {
@@ -897,6 +968,88 @@ fn threads() -> String {
     std::thread::available_parallelism()
         .map(|n| n.get().to_string())
         .unwrap_or_else(|_| "2".into())
+}
+
+fn resources_main(json_out: bool, action: &ResourceCmd) -> Result<i32> {
+    match action {
+        ResourceCmd::Status | ResourceCmd::Doctor => {
+            let runtime = runtime_dir()?;
+            let view = collect_host()?;
+            let snapshot = report(&runtime, &view, &Policy::from_env())?;
+            let text = status_text(&snapshot);
+            emit(json_out, &snapshot, &text)?;
+            let failing = matches!(action, ResourceCmd::Doctor) && !snapshot.ok;
+            Ok(if failing { 1 } else { 0 })
+        }
+        ResourceCmd::Reserve {
+            workload,
+            repo,
+            memory,
+            cpus,
+            wait,
+        } => {
+            let mut req = admit_request(workload, repo, *memory, *cpus)?;
+            req.owner_pid = shell_owner_pid();
+            let rec = admit_retry(&req, *wait)?;
+            if json_out {
+                println!("{}", serde_json::to_string_pretty(&rec)?);
+            } else {
+                println!("{}", rec.id);
+            }
+            Ok(0)
+        }
+        ResourceCmd::Release { id, forget } => {
+            release_id(&runtime_dir()?, id, *forget)?;
+            Ok(0)
+        }
+        ResourceCmd::Attach { id, pid } => {
+            attach_pid(&runtime_dir()?, id, *pid)?;
+            Ok(0)
+        }
+        ResourceCmd::Run {
+            workload,
+            repo,
+            memory,
+            cpus,
+            wait,
+            timeout,
+            command,
+        } => {
+            let req = admit_request(workload, repo, *memory, *cpus)?;
+            run_reserved(&req, *wait, *timeout, command)
+        }
+    }
+}
+
+fn admit_request(
+    workload: &str,
+    repo: &Option<PathBuf>,
+    memory: Option<u32>,
+    cpus: Option<u32>,
+) -> Result<AdmitRequest> {
+    let workload = Workload::parse(workload)
+        .ok_or_else(|| Error::message(format!("unknown workload {workload}")))?;
+    let spec = workload.spec();
+    let (memory, cpus) = clamp_launch(
+        workload,
+        memory.unwrap_or(spec.memory_mib),
+        cpus.unwrap_or(spec.cpus),
+        memory.is_some(),
+        cpus.is_some(),
+    )?;
+    let repo = match repo {
+        Some(path) => path.display().to_string(),
+        None => std::env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "unknown".into()),
+    };
+    Ok(AdmitRequest {
+        owner_pid: std::process::id(),
+        repo,
+        workload,
+        memory_mib: memory,
+        cpus,
+    })
 }
 
 fn emit(json_out: bool, value: &impl serde::Serialize, text: &str) -> Result<()> {

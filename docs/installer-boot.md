@@ -8,7 +8,7 @@ Verified Linux installer boots live in `sbm-catalog`. The command is:
 ../sbm-catalog/tools/boot-installer.sh ISO EXPECTED_SHA256 [SECONDS]
 ```
 
-The script checks SHA-256, refuses a path under `/dev/`, copies the EDK2 variable store, and runs `qemu-system-aarch64 -machine virt,accel=hvf` with the ISO as a CD-ROM. There is no host disk argument. On this Apple Silicon Mac that guest is generic AArch64 UEFI, not an Apple Silicon boot chain.
+The script checks SHA-256, refuses a path under `/dev/`, copies the EDK2 variable store, reserves a 2048 MiB `linux` workload through `sbm-lab resources`, and runs `qemu-system-aarch64 -machine virt,accel=hvf` with the ISO as a CD-ROM. There is no host disk argument. On this Apple Silicon Mac that guest is generic AArch64 UEFI, not an Apple Silicon boot chain.
 
 Runs recorded on 2026-11-26, each a single boot log rather than a benchmark:
 
