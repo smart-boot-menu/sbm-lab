@@ -637,7 +637,7 @@ fn run_one_negative(root: &Path, opts: &NegativeOptions, scenario: &str) -> Resu
     let decoy_bytes = build_decoy_esp(root, opts.arch)?;
     fs::write(&decoy_raw, &decoy_bytes)?;
     let decoy_hash_before = sha256_file(&decoy_raw)?;
-    let decoy_esp_guid = decoy_esp_partuuid(&decoy_raw)?;
+    let (decoy_esp_guid, decoy_esp_offset, decoy_esp_len) = decoy_esp_info(&decoy_raw)?;
 
     // Copy the immutable release image to a disposable raw copy inside run_dir so
     // we can inject scenario-specific mutations without touching the original.
@@ -897,7 +897,33 @@ fn run_one_negative(root: &Path, opts: &NegativeOptions, scenario: &str) -> Resu
     let serial_text = fs::read_to_string(&serial_log).unwrap_or_default();
     let markers = parse_markers(&serial_text);
     let decoy_hash_after = sha256_file(&decoy_raw)?;
-    let decoy_esp_unchanged = decoy_hash_before == decoy_hash_after;
+    // In local-boot-request-positive, the chainloaded fixture binary on the decoy
+    // ESP intentionally writes EFI/sbm/test/chainload-ok.txt to prove it ran.
+    // Verify zero SBM state writes landed on the decoy ESP and its marker stayed
+    // intact; for every other scenario require strict byte-for-byte immutability.
+    let decoy_esp_unchanged = if scenario == "local-boot-request-positive" {
+        let marker_ok = read_esp_slice_file(
+            &decoy_raw,
+            decoy_esp_offset,
+            decoy_esp_len,
+            "EFI/decoy-marker.txt",
+        )
+        .ok()
+        .is_some_and(|b| String::from_utf8_lossy(&b).contains("SBM decoy ESP"));
+        let sbm_state_absent = [
+            "EFI/sbm/state/last_attempt.json",
+            "EFI/sbm/state/boot-success.json",
+            "EFI/sbm/handoff/current.json",
+            "EFI/sbm/handoff/requested-command.json",
+        ]
+        .iter()
+        .all(|rel| {
+            read_esp_slice_file(&decoy_raw, decoy_esp_offset, decoy_esp_len, rel).is_err()
+        });
+        marker_ok && sbm_state_absent
+    } else {
+        decoy_hash_before == decoy_hash_after
+    };
     let inputs_unchanged = sha256_file(&opts.image)? == image_hash_before
         && sha256_file(&fw.code)? == code_hash_before
         && sha256_file(&fw.vars_template)? == vars_hash_before;
@@ -1022,9 +1048,17 @@ fn run_one_negative(root: &Path, opts: &NegativeOptions, scenario: &str) -> Resu
                 serial_text.contains("policy reason=core-request"),
             );
             assertions.insert("request_deleted_before_act".into(), req_removed);
+            let chainload_marker = read_esp_slice_file(
+                &decoy_raw,
+                decoy_esp_offset,
+                decoy_esp_len,
+                "EFI/sbm/test/chainload-ok.txt",
+            )
+            .ok()
+            .is_some_and(|b| String::from_utf8_lossy(&b).contains("chainload-ok"));
             assertions.insert(
                 "requested_target_launched".into(),
-                serial_text.contains("fixture_started"),
+                serial_text.contains("fixture_started") && chainload_marker,
             );
         }
         _ => {}
@@ -1256,7 +1290,7 @@ fn mcopy_into_esp(
     Ok(())
 }
 
-fn decoy_esp_partuuid(decoy_raw: &Path) -> Result<String> {
+fn decoy_esp_info(decoy_raw: &Path) -> Result<(String, u64, u64)> {
     let file = File::open(decoy_raw)?;
     let size = file.metadata()?.len();
     let table = sbm_media::gpt::read_gpt_strict(&file, size, "decoy")
@@ -1266,7 +1300,9 @@ fn decoy_esp_partuuid(decoy_raw: &Path) -> Result<String> {
         .iter()
         .find(|p| p.type_guid == sbm_media::gpt::types::esp())
         .ok_or_else(|| Error::message("decoy image missing ESP"))?;
-    Ok(esp.unique_guid.to_string().to_ascii_lowercase())
+    let offset = esp.first_lba * SECTOR;
+    let len = (esp.last_lba - esp.first_lba + 1) * SECTOR;
+    Ok((esp.unique_guid.to_string().to_ascii_lowercase(), offset, len))
 }
 
 // ---------------------------------------------------------------------------
