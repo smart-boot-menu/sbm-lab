@@ -917,9 +917,7 @@ fn run_one_negative(root: &Path, opts: &NegativeOptions, scenario: &str) -> Resu
             "EFI/sbm/handoff/requested-command.json",
         ]
         .iter()
-        .all(|rel| {
-            read_esp_slice_file(&decoy_raw, decoy_esp_offset, decoy_esp_len, rel).is_err()
-        });
+        .all(|rel| read_esp_slice_file(&decoy_raw, decoy_esp_offset, decoy_esp_len, rel).is_err());
         marker_ok && sbm_state_absent
     } else {
         decoy_hash_before == decoy_hash_after
@@ -1302,7 +1300,11 @@ fn decoy_esp_info(decoy_raw: &Path) -> Result<(String, u64, u64)> {
         .ok_or_else(|| Error::message("decoy image missing ESP"))?;
     let offset = esp.first_lba * SECTOR;
     let len = (esp.last_lba - esp.first_lba + 1) * SECTOR;
-    Ok((esp.unique_guid.to_string().to_ascii_lowercase(), offset, len))
+    Ok((
+        esp.unique_guid.to_string().to_ascii_lowercase(),
+        offset,
+        len,
+    ))
 }
 
 // ---------------------------------------------------------------------------
