@@ -159,7 +159,7 @@ jobs:
                   "-accel", "kvm",
                   "-cpu", "qemu64",
                   "-m", "1024",
-                  "-smp", "2",
+                  "-smp", "1",
                   "-display", "none",
                   "-nodefaults",
                   "-vga", "none",
@@ -205,9 +205,13 @@ jobs:
 
               if not ready:
                   err_txt = open(stderr_log, "r", errors="replace").read()
+                  dbg_tail = ""
+                  if os.path.exists(debugcon_log):
+                      dbg_lines = open(debugcon_log, "r", errors="replace").read().splitlines()
+                      dbg_tail = "\n".join(dbg_lines[-80:])
                   raise SystemExit(
                       f"Run {i} failed to reach menu_ready+glyph_cache (wall_ms={wall_ms}).\n"
-                      f"STDERR:\n{err_txt}\nSERIAL:\n{serial_text}"
+                      f"STDERR:\n{err_txt}\nSERIAL:\n{serial_text}\nDEBUGCON TAIL:\n{dbg_tail}"
                   )
 
               def extract_int(pattern, label):
@@ -234,7 +238,7 @@ jobs:
               if m_gop:
                   sample["gop"] = m_gop.group(1)
               samples.append(sample)
-              print(f"Run {i:02d}/{runs}: menu_ready={sample['menu_ready_us']} us ({sample['menu_ready_us']/1000:.2f} ms), first_frame={sample['first_frame_us']} us, wall={wall_ms} ms")
+              print(f"Run {i:02d}/{runs}: menu_ready={sample['menu_ready_us']} us ({sample['menu_ready_us']/1000:.2f} ms), first_frame={sample['first_frame_us']} us, wall={wall_ms} ms", flush=True)
 
               if i == 1:
                   shutil.copyfile(serial_log, os.path.join("out", "sample-run1-serial.log"))
