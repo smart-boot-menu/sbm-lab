@@ -1645,11 +1645,13 @@ mod tests {
         let dir = test_scratch("budget");
         let view = quiet(16384);
         let rules = policy();
-        let first_mib = if cfg!(target_os = "macos") {
-            4096
-        } else {
-            8192
-        };
+        let budget = guest_budget_mib(
+            view.total_mib,
+            view.pressure,
+            view.swap_used_mib,
+            view.swap_total_mib,
+        );
+        let first_mib = (budget - 1024) as u32;
         let first_wl = if cfg!(target_os = "macos") {
             Workload::Build
         } else {
