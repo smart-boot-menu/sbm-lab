@@ -20,10 +20,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SCHEMA: &str = "sbm-lab.resources.v1";
-/// An 8192 MiB aarch64 guest on this Mac was idle at about 533 MiB inside the
+/// An 8192 MiB aarch64 guest on macOS HVF was idle at about 533 MiB inside the
 /// guest and still charged about 15 GB of physical footprint. RSS is not the
-/// admission number. Each reserved MiB counts as this many MiB of host RAM.
+/// admission number on macOS. Linux KVM demand-pages guest RAM (~1x).
+#[cfg(target_os = "macos")]
 const FOOTPRINT_PER_GUEST_MIB: u64 = 2;
+#[cfg(not(target_os = "macos"))]
+const FOOTPRINT_PER_GUEST_MIB: u64 = 1;
 /// `hw.memsize` on a 16 GiB Mac is 16384 MiB. Linux `MemTotal` for that
 /// class of machine is lower by the kernel reservation, so the same floor
 /// starts at 15 GiB.
@@ -188,6 +191,10 @@ pub struct Reservation {
     pub owner_start: Option<String>,
     #[serde(default)]
     pub qemu_start: Option<String>,
+    /// True when the reservation intentionally outlives its launching shell
+    /// (for example, a persistent builder VM started via `setsid`).
+    #[serde(default)]
+    pub detached: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +204,7 @@ pub struct AdmitRequest {
     pub workload: Workload,
     pub memory_mib: u32,
     pub cpus: u32,
+    pub detached: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,6 +261,15 @@ impl ReservationGuard {
         self.qemu_pid = Some(pid);
         self.qemu_start = start;
         Ok(())
+    }
+
+    /// Clear tracked QEMU pid immediately after `child.wait()` reaps it so a
+    /// signal handler or `Drop` can never signal a subsequently reused PID.
+    pub fn mark_reaped(&mut self) {
+        if let Some(pid) = self.qemu_pid.take() {
+            clear_noted_qemu_pid(pid);
+        }
+        self.qemu_start = None;
     }
 }
 
@@ -353,14 +370,30 @@ pub fn host_floor_mib(
     floor.min(total_mib)
 }
 
+pub fn guest_budget_mib_for(
+    total_mib: u64,
+    pressure: Pressure,
+    swap_used_mib: u64,
+    swap_total_mib: u64,
+    footprint_multiplier: u64,
+) -> u64 {
+    let floor = host_floor_mib(total_mib, pressure, swap_used_mib, swap_total_mib);
+    total_mib.saturating_sub(floor) / footprint_multiplier.max(1)
+}
+
 pub fn guest_budget_mib(
     total_mib: u64,
     pressure: Pressure,
     swap_used_mib: u64,
     swap_total_mib: u64,
 ) -> u64 {
-    let floor = host_floor_mib(total_mib, pressure, swap_used_mib, swap_total_mib);
-    total_mib.saturating_sub(floor) / FOOTPRINT_PER_GUEST_MIB
+    guest_budget_mib_for(
+        total_mib,
+        pressure,
+        swap_used_mib,
+        swap_total_mib,
+        FOOTPRINT_PER_GUEST_MIB,
+    )
 }
 
 pub fn collect_host() -> Result<HostView> {
@@ -428,6 +461,7 @@ fn admit_inner(
         cpus: req.cpus,
         heavy: req.workload.spec().heavy,
         created_unix: unix_now(),
+        detached: req.detached,
     };
     store(runtime, &rec)?;
     Ok(rec)
@@ -492,11 +526,13 @@ pub fn run_reserved(
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
+            guard.mark_reaped();
             return Ok(status.code().unwrap_or(1));
         }
         if timeout_secs > 0 && started.elapsed() >= Duration::from_secs(timeout_secs) {
             let _ = child.kill();
             let _ = child.wait();
+            guard.mark_reaped();
             return Ok(124);
         }
         thread::sleep(Duration::from_millis(200));
@@ -701,7 +737,7 @@ fn build_report(
         let qemu_alive = rec
             .qemu_pid
             .is_some_and(|pid| tracked_alive(pid, &rec.qemu_start));
-        if !owner_alive && qemu_alive {
+        if !owner_alive && qemu_alive && !rec.detached {
             warnings.push(format!(
                 "reservation {} is orphaned; qemu pid {} is still running and will not be killed",
                 rec.id,
@@ -925,14 +961,25 @@ pub fn owns_reservation(
     }
     ancestors
         .iter()
-        .take(2)
+        .take(6)
         .any(|pid| *pid > 1 && *pid == owner)
 }
 
 fn caller_owns(owner: u32) -> bool {
-    let parent = parent_of(std::process::id());
-    let grand = if parent > 1 { parent_of(parent) } else { 0 };
-    owns_reservation(owner, std::process::id(), &[parent, grand], env_owner_pid())
+    let mut ancestors = Vec::with_capacity(6);
+    let mut current = parent_of(std::process::id());
+    for _ in 0..6 {
+        if current <= 1 {
+            break;
+        }
+        ancestors.push(current);
+        let next = parent_of(current);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    owns_reservation(owner, std::process::id(), &ancestors, env_owner_pid())
 }
 
 fn parent_of(pid: u32) -> u32 {
@@ -1312,6 +1359,10 @@ pub fn note_qemu_pid(pid: u32) {
     NOTED_QEMU.store(pid, Ordering::SeqCst);
 }
 
+pub fn clear_noted_qemu_pid(pid: u32) {
+    let _ = NOTED_QEMU.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+}
+
 pub fn tie_to_parent(command: &mut Command) {
     #[cfg(target_os = "linux")]
     {
@@ -1511,6 +1562,7 @@ mod tests {
             workload,
             memory_mib: memory,
             cpus: workload.spec().cpus,
+            detached: false,
         }
     }
 
@@ -1525,11 +1577,18 @@ mod tests {
 
     #[test]
     fn budget_matches_the_16_gib_mac() {
-        assert_eq!(guest_budget_mib(16384, Pressure::Normal, 0, 0), 5120);
-        assert_eq!(guest_budget_mib(16384, Pressure::Warn, 1968, 3072), 3584);
-        assert_eq!(guest_budget_mib(16384, Pressure::Critical, 0, 0), 0);
+        assert_eq!(guest_budget_mib_for(16384, Pressure::Normal, 0, 0, 2), 5120);
+        assert_eq!(
+            guest_budget_mib_for(16384, Pressure::Warn, 1968, 3072, 2),
+            3584
+        );
+        assert_eq!(guest_budget_mib_for(16384, Pressure::Critical, 0, 0, 2), 0);
+        assert_eq!(
+            guest_budget_mib_for(16384, Pressure::Normal, 0, 0, 1),
+            10240
+        );
         assert_eq!(host_floor_mib(15999, Pressure::Normal, 0, 0), 6144);
-        assert!(guest_budget_mib(15999, Pressure::Normal, 0, 0) >= 4096);
+        assert!(guest_budget_mib_for(15999, Pressure::Normal, 0, 0, 2) >= 4096);
         let (used, total) =
             parse_swapusage("total = 3072.00M  used = 1967.75M  free = 1104.25M  (encrypted)");
         assert_eq!(total, 3072);
@@ -1586,7 +1645,17 @@ mod tests {
         let dir = test_scratch("budget");
         let view = quiet(16384);
         let rules = policy();
-        try_admit(&dir, &view, &rules, &request(Workload::Build, 4096)).unwrap();
+        let first_mib = if cfg!(target_os = "macos") {
+            4096
+        } else {
+            8192
+        };
+        let first_wl = if cfg!(target_os = "macos") {
+            Workload::Build
+        } else {
+            Workload::Ram
+        };
+        try_admit(&dir, &view, &rules, &request(first_wl, first_mib)).unwrap();
         let err = try_admit(&dir, &view, &rules, &request(Workload::Linux, 2048)).unwrap_err();
         assert!(err.to_string().contains("budget"), "{err}");
     }
@@ -1615,7 +1684,7 @@ mod tests {
         let view = HostView {
             qemu: vec![RunningQemu {
                 pid,
-                guest_mib: 8192,
+                guest_mib: 9216,
                 cpus: 4,
                 memory_known: true,
                 command: "qemu-system-aarch64 -m 8192".into(),
@@ -1623,7 +1692,7 @@ mod tests {
             }],
             ..quiet(16384)
         };
-        let err = try_admit(&dir, &view, &policy(), &request(Workload::Efi, 1024)).unwrap_err();
+        let err = try_admit(&dir, &view, &policy(), &request(Workload::Linux, 2048)).unwrap_err();
         assert!(err.to_string().contains("budget"), "{err}");
         assert!(pid_alive(pid));
         let _ = sleeper.kill();
@@ -1655,6 +1724,7 @@ mod tests {
             created_unix: 1,
             owner_start: None,
             qemu_start: None,
+            detached: false,
         };
         store(&dir, &stale).unwrap();
         try_admit(
@@ -1690,6 +1760,7 @@ mod tests {
             created_unix: 1,
             owner_start: None,
             qemu_start: None,
+            detached: false,
         };
         store(&dir, &rec).unwrap();
         let err = release_id(&dir, "foreign-vm", false).unwrap_err();
@@ -1853,6 +1924,7 @@ mod tests {
             created_unix: 1,
             owner_start: Some("Thu Jan 1 00:00:00 1970".into()),
             qemu_start: Some("Thu Jan 1 00:00:00 1970".into()),
+            detached: false,
         };
         store(&dir, &rec).unwrap();
         let live = load_and_reap(&dir).unwrap();
@@ -1883,5 +1955,78 @@ mod tests {
         let err =
             try_admit(&dir, &critical, &policy(), &request(Workload::Linux, 2048)).unwrap_err();
         assert!(err.to_string().contains("critical"), "{err}");
+    }
+
+    #[test]
+    fn detached_reservation_with_live_qemu_is_not_reported_as_orphaned() {
+        let dir = test_scratch("detached");
+        let mut dead_owner = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let owner_pid = dead_owner.id();
+        let _ = dead_owner.kill();
+        let _ = dead_owner.wait();
+
+        let mut live_qemu = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let qemu_pid = live_qemu.id();
+
+        let rec = Reservation {
+            schema: SCHEMA.into(),
+            id: "detached-builder".into(),
+            owner_pid,
+            qemu_pid: Some(qemu_pid),
+            repo: "sbm-core".into(),
+            workload: Workload::Build,
+            memory_mib: 4096,
+            cpus: 2,
+            heavy: true,
+            created_unix: 1,
+            owner_start: None,
+            qemu_start: process_start_token(qemu_pid),
+            detached: true,
+        };
+        store(&dir, &rec).unwrap();
+        let view = HostView {
+            qemu: vec![RunningQemu {
+                pid: qemu_pid,
+                guest_mib: 4096,
+                cpus: 2,
+                memory_known: true,
+                command: "qemu-system-aarch64 -m 4096".into(),
+                repo: Some("sbm-core".into()),
+            }],
+            ..quiet(16384)
+        };
+        let snap = report(&dir, &view, &policy()).unwrap();
+        assert!(
+            snap.ok,
+            "detached builder must pass doctor: {:?}",
+            snap.warnings
+        );
+        let _ = live_qemu.kill();
+        let _ = live_qemu.wait();
+    }
+
+    #[test]
+    fn owns_reservation_accepts_depth_three_ancestor() {
+        assert!(owns_reservation(40, 10, &[20, 30, 40], None));
+        assert!(!owns_reservation(99, 10, &[20, 30, 40], None));
+    }
+
+    #[test]
+    fn clear_noted_qemu_pid_resets_only_matching_pid() {
+        note_qemu_pid(424242);
+        clear_noted_qemu_pid(111111);
+        assert_eq!(NOTED_QEMU.load(Ordering::SeqCst), 424242);
+        clear_noted_qemu_pid(424242);
+        assert_eq!(NOTED_QEMU.load(Ordering::SeqCst), 0);
     }
 }

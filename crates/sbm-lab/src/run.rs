@@ -13,7 +13,8 @@ use crate::profile::{BootKind, NetworkMode, Profile, Role};
 use crate::proxy::DelayProxy;
 use crate::qmp::Qmp;
 use crate::resources::{
-    AdmitRequest, clamp_launch, hold_for_run, note_qemu_pid, tie_to_parent, workload_for,
+    AdmitRequest, clamp_launch, clear_noted_qemu_pid, hold_for_run, note_qemu_pid, tie_to_parent,
+    workload_for,
 };
 use crate::util::{
     FileLock, env_u32, pe_machine, reject_host_device, sha256_file, short_id, which, write_file,
@@ -121,7 +122,11 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
         .cpus
         .unwrap_or(opts.profile.cpus)
         .clamp(1, env_u32("SBM_LAB_MAX_CPUS", 4));
-    let workload = workload_for(opts.profile.role, opts.profile.gpu, opts.graphical);
+    let workload = workload_for(
+        opts.profile.role,
+        opts.profile.gpu,
+        opts.graphical || opts.core.is_some(),
+    );
     let (memory, cpus) = clamp_launch(
         workload,
         requested_memory,
@@ -137,6 +142,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
             workload,
             memory_mib: memory,
             cpus,
+            detached: false,
         },
     )?;
     let qemu_name = arch.qemu_binary();
@@ -425,10 +431,14 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
         Err(err) => {
             let _ = child.kill();
             let _ = child.wait();
+            budget.mark_reaped();
             failure = Some(err.to_string());
             Observed::default()
         }
     };
+    if child.try_wait().ok().flatten().is_some() {
+        budget.mark_reaped();
+    }
     if let Some(proc) = swtpm.as_mut() {
         let _ = proc.kill();
         let _ = proc.wait();
@@ -633,12 +643,14 @@ fn observe(
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
+            clear_noted_qemu_pid(child.id());
             if opts.journal {
                 return Err(Error::message("timed out before journal-begin"));
             }
             break;
         }
         if let Some(status) = child.try_wait()? {
+            clear_noted_qemu_pid(child.id());
             exit_code = status.code();
             break;
         }
@@ -697,6 +709,7 @@ fn observe(
             std::thread::sleep(Duration::from_millis(200));
             let _ = child.kill();
             let _ = child.wait();
+            clear_noted_qemu_pid(child.id());
             break;
         }
         if names.contains(&"halt") && !opts.journal {
@@ -705,6 +718,7 @@ fn observe(
                 let _ = qmp.quit();
             }
             let _ = child.wait();
+            clear_noted_qemu_pid(child.id());
             break;
         }
         if let Some(after) = &opts.reset_after
@@ -725,6 +739,7 @@ fn observe(
                 let _ = qmp.quit();
             }
             let _ = child.wait();
+            clear_noted_qemu_pid(child.id());
             break;
         }
         let ready = !expect.is_empty()
@@ -744,6 +759,7 @@ fn observe(
                 let _ = qmp.quit();
             }
             let _ = child.wait();
+            clear_noted_qemu_pid(child.id());
             break;
         }
     }

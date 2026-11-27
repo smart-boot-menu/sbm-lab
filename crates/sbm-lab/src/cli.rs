@@ -5,7 +5,9 @@ use crate::bench::{class_note, methodology_complete, summarize};
 use crate::error::{Error, Result};
 use crate::fixtures::fixture_ids;
 use crate::host::doctor;
-use crate::integration::{IntegrationOptions, run_integration};
+use crate::integration::{
+    IntegrationOptions, NegativeOptions, run_integration, run_integration_negative,
+};
 use crate::product::{find_core_uki, find_menu};
 use crate::profile::{
     BootKind, NetworkMode, ScenarioMode, Tier, find_profile, load_profiles, load_scenarios,
@@ -118,12 +120,15 @@ enum CommandKind {
         id: Option<String>,
         #[arg(long)]
         efi: Option<PathBuf>,
-        /// Dual-architecture SBM raw image for `--tier integration`.
+        /// SBM raw image for `--tier integration` or `--tier integration-negative`.
         #[arg(long)]
         image: Option<PathBuf>,
-        /// Architecture(s) for `--tier integration`: aarch64, x86_64, or both.
-        #[arg(long, default_value = "both")]
+        /// Architecture(s) for `--tier integration*`: native (default), aarch64, x86_64, or both.
+        #[arg(long, default_value = "native")]
         arch: String,
+        /// Virtual GPU for `--tier integration`: virtio (default) or software/ramfb (software fallback).
+        #[arg(long, default_value = "virtio", value_parser = ["virtio", "software", "ramfb"])]
+        gpu: String,
         /// Guest memory in MiB for `--tier integration`.
         #[arg(long, default_value_t = 4096)]
         memory: u32,
@@ -204,6 +209,9 @@ enum ResourceCmd {
         /// Retry for this many seconds instead of refusing immediately.
         #[arg(long, default_value_t = 0)]
         wait: u64,
+        /// Mark reservation as intentionally detached (survives launching shell exit).
+        #[arg(long)]
+        detached: bool,
     },
     /// Drop a reservation. Does not signal QEMU.
     Release {
@@ -404,6 +412,7 @@ pub fn execute() -> Result<i32> {
             efi,
             image,
             arch,
+            gpu,
             memory,
             artifacts_dir,
             keep,
@@ -416,8 +425,24 @@ pub fn execute() -> Result<i32> {
                     &root,
                     &img,
                     &arch,
+                    &gpu,
                     memory,
                     timeout.max(300),
+                    artifacts_dir,
+                    keep,
+                    cli.json,
+                )
+            } else if tier == "integration-negative" {
+                let img = image.ok_or_else(|| {
+                    Error::message("--tier integration-negative requires --image PATH")
+                })?;
+                run_integration_negative_tier(
+                    &root,
+                    &img,
+                    &arch,
+                    id.as_deref(),
+                    memory,
+                    timeout.max(180),
                     artifacts_dir,
                     keep,
                     cli.json,
@@ -510,24 +535,43 @@ pub fn execute() -> Result<i32> {
     }
 }
 
+fn parse_integration_arches(arch_arg: &str) -> Result<Vec<Arch>> {
+    match arch_arg {
+        "native" => {
+            if std::env::consts::ARCH == "aarch64" {
+                Ok(vec![Arch::Aarch64])
+            } else {
+                Ok(vec![Arch::X86_64])
+            }
+        }
+        "aarch64" | "arm64" => Ok(vec![Arch::Aarch64]),
+        "x86_64" | "x86-64" => Ok(vec![Arch::X86_64]),
+        "both" => Ok(vec![Arch::Aarch64, Arch::X86_64]),
+        other => Err(Error::message(format!(
+            "unknown integration arch {other}; use native, aarch64, x86_64, or both"
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_integration_tier(
     root: &Path,
     image: &Path,
     arch_arg: &str,
+    gpu_arg: &str,
     memory_mib: u32,
     timeout_secs: u64,
     artifacts_dir: Option<PathBuf>,
     keep: bool,
     json_out: bool,
 ) -> Result<i32> {
-    let arches = match arch_arg {
-        "aarch64" | "arm64" => vec![Arch::Aarch64],
-        "x86_64" | "x86-64" => vec![Arch::X86_64],
-        "both" => vec![Arch::Aarch64, Arch::X86_64],
+    let arches = parse_integration_arches(arch_arg)?;
+    let gpu = match gpu_arg {
+        "virtio" => crate::profile::GpuKind::Virtio,
+        "software" | "ramfb" => crate::profile::GpuKind::Software,
         other => {
             return Err(Error::message(format!(
-                "unknown integration arch {other}; use aarch64, x86_64, or both"
+                "unknown integration gpu {other}; use virtio or ramfb"
             )));
         }
     };
@@ -539,6 +583,7 @@ fn run_integration_tier(
             &IntegrationOptions {
                 image: image.to_path_buf(),
                 arch,
+                gpu,
                 memory_mib,
                 cpus: 2,
                 timeout_secs,
@@ -550,6 +595,46 @@ fn run_integration_tier(
             failed += 1;
         }
         reports.push(report);
+    }
+    emit(json_out, &reports, &serde_json::to_string_pretty(&reports)?)?;
+    Ok(if failed == 0 { 0 } else { 1 })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_integration_negative_tier(
+    root: &Path,
+    image: &Path,
+    arch_arg: &str,
+    scenario: Option<&str>,
+    memory_mib: u32,
+    timeout_secs: u64,
+    artifacts_dir: Option<PathBuf>,
+    keep: bool,
+    json_out: bool,
+) -> Result<i32> {
+    let arches = parse_integration_arches(arch_arg)?;
+    let mut reports = Vec::new();
+    let mut failed = 0;
+    for arch in arches {
+        let batch = run_integration_negative(
+            root,
+            &NegativeOptions {
+                image: image.to_path_buf(),
+                arch,
+                scenario: scenario.map(str::to_string),
+                memory_mib,
+                cpus: 2,
+                timeout_secs,
+                artifacts_dir: artifacts_dir.clone(),
+                keep,
+            },
+        )?;
+        for report in batch {
+            if !report.success {
+                failed += 1;
+            }
+            reports.push(report);
+        }
     }
     emit(json_out, &reports, &serde_json::to_string_pretty(&reports)?)?;
     Ok(if failed == 0 { 0 } else { 1 })
@@ -1076,9 +1161,11 @@ fn resources_main(json_out: bool, action: &ResourceCmd) -> Result<i32> {
             cpus,
             owner,
             wait,
+            detached,
         } => {
             let mut req = admit_request(workload, repo, *memory, *cpus)?;
             req.owner_pid = owner.unwrap_or_else(shell_owner_pid);
+            req.detached = *detached;
             let rec = admit_retry(&req, *wait)?;
             if json_out {
                 println!("{}", serde_json::to_string_pretty(&rec)?);
@@ -1138,6 +1225,7 @@ fn admit_request(
         workload,
         memory_mib: memory,
         cpus,
+        detached: false,
     })
 }
 

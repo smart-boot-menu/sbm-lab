@@ -32,6 +32,10 @@ sbm_lab_bin() {
 # A direct `sbm-resources.sh reserve` process exits immediately, so its parent
 # is the owner that will attach later.
 sbm_owner_pid() {
+    if [ -n "${SBM_OWNER_PID:-}" ]; then
+        printf '%s\n' "$SBM_OWNER_PID"
+        return 0
+    fi
     if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         printf '%s\n' "$PPID"
     else
@@ -42,11 +46,15 @@ sbm_owner_pid() {
 sbm_reserve() {
     local workload=$1 memory=$2 cpus=$3 repo=$4
     local bin owner
+    local extra=()
     bin=$(sbm_lab_bin) || return 1
     owner=$(sbm_owner_pid)
+    if [ "${SBM_DETACHED:-0}" = "1" ]; then
+        extra+=(--detached)
+    fi
     SBM_OWNER_PID="$owner" "$bin" resources reserve \
         --workload "$workload" --memory "$memory" --cpus "$cpus" --repo "$repo" \
-        --owner "$owner"
+        --owner "$owner" "${extra[@]}"
 }
 
 sbm_attach() {
