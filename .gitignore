@@ -1,5 +1,6 @@
 /target
 /var
+/build
 /fixtures/efi-probe/target
 **/*.rs.bk
 *.pdb
