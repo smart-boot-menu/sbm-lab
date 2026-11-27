@@ -1,9 +1,12 @@
-use crate::error::{Error, Result};
-use sha2::{Digest, Sha256};
+//! Thin GPT fixture adapter delegating to `sbm-media::gpt`.
 
-pub const SECTOR: u64 = 512;
-const ENTRY_SIZE: usize = 128;
-const ENTRY_COUNT: usize = 128;
+use crate::error::{Error, Result};
+use sbm_media::gpt::{self, GptPartition, Guid};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+pub const SECTOR: u64 = gpt::SECTOR;
 
 #[derive(Debug, Clone)]
 pub struct PartitionSpec {
@@ -28,56 +31,34 @@ pub struct BuiltDisk {
 }
 
 pub fn parse_guid(text: &str) -> Result<[u8; 16]> {
-    let hex: String = text.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 {
-        return Err(Error::message(format!("invalid guid {text}")));
-    }
-    let mut raw = [0u8; 16];
-    for i in 0..16 {
-        raw[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| Error::message(format!("invalid guid {text}")))?;
-    }
-    let mut out = [0u8; 16];
-    out[0..4].copy_from_slice(&raw[0..4]);
-    out[0..4].reverse();
-    out[4..6].copy_from_slice(&raw[4..6]);
-    out[4..6].reverse();
-    out[6..8].copy_from_slice(&raw[6..8]);
-    out[6..8].reverse();
-    out[8..16].copy_from_slice(&raw[8..16]);
-    Ok(out)
+    text.parse::<Guid>()
+        .map(|g| g.0)
+        .map_err(|e| Error::message(format!("invalid guid {text}: {e}")))
 }
 
 pub fn guid_from_name(name: &str) -> [u8; 16] {
-    let digest = Sha256::digest(format!("sbm-lab-v1:{name}").as_bytes());
-    let mut guid = [0u8; 16];
-    guid.copy_from_slice(&digest[..16]);
-    guid[6] = (guid[6] & 0x0f) | 0x50;
-    guid[8] = (guid[8] & 0x3f) | 0x80;
-    guid
+    Guid::derive("sbm-lab-v1", &[name.as_bytes()]).0
 }
 
 pub fn esp_guid() -> [u8; 16] {
-    parse_guid("C12A7328-F81F-11D2-BA4B-00A0C93EC93B").expect("esp guid")
+    gpt::types::esp().0
 }
 
 pub fn linux_guid() -> [u8; 16] {
-    parse_guid("0FC63DAF-8483-4772-8E79-3D69D8477DE4").expect("linux guid")
+    gpt::types::linux_generic().0
 }
 
 pub fn microsoft_basic_guid() -> [u8; 16] {
-    parse_guid("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7").expect("ms guid")
+    gpt::types::microsoft_basic_data().0
 }
 
 pub fn apple_apfs_guid() -> [u8; 16] {
-    parse_guid("7C3457EF-0000-11AA-AA11-00306543ECAC").expect("apfs guid")
+    gpt::types::apple_apfs().0
 }
 
 pub fn empty_mbr(total_bytes: u64) -> Vec<u8> {
     let mut bytes = vec![0u8; total_bytes as usize];
-    let n = bytes.len();
-    bytes[n.min(510).saturating_sub(0)] = 0x55;
-    if n > 511 {
+    if bytes.len() > 511 {
         bytes[510] = 0x55;
         bytes[511] = 0xAA;
     }
@@ -86,8 +67,9 @@ pub fn empty_mbr(total_bytes: u64) -> Vec<u8> {
 
 pub fn build_gpt(disk_name: &str, parts: &[PartitionSpec], corrupt: bool) -> Result<BuiltDisk> {
     let mut cursor = 2048u64;
-    let mut placed = Vec::new();
-    for part in parts {
+    let mut placed = Vec::with_capacity(parts.len());
+    let mut entries = Vec::with_capacity(parts.len());
+    for (index, part) in parts.iter().enumerate() {
         let sectors = part.size_bytes.div_ceil(SECTOR).max(1);
         let aligned = sectors.div_ceil(2048) * 2048;
         let start = cursor;
@@ -99,185 +81,78 @@ pub fn build_gpt(disk_name: &str, parts: &[PartitionSpec], corrupt: bool) -> Res
             start_lba: start,
             end_lba: end,
         });
+        let idx = (index as u32 + 1).to_le_bytes();
+        entries.push(GptPartition {
+            number: index as u32 + 1,
+            type_guid: Guid(part.type_guid),
+            unique_guid: Guid::derive(
+                "sbm-lab-v1-part",
+                &[disk_name.as_bytes(), &idx, part.name.as_bytes()],
+            ),
+            first_lba: start,
+            last_lba: end,
+            attributes: 0,
+            name: part.name.clone(),
+        });
     }
     let backup_entries = cursor.max(2048);
-    let backup_header = backup_entries + 32;
+    let backup_header = backup_entries + gpt::ENTRY_SECTORS;
     let total = backup_header + 1;
-    let mut bytes = vec![0u8; (total * SECTOR) as usize];
-    write_protective_mbr(&mut bytes, total);
-    let entries = entry_bytes(&placed, disk_name)?;
-    write_header(
-        &mut bytes,
-        HeaderLoc {
-            current: 1,
-            backup: backup_header,
-            first_usable: 2048,
-            last_usable: backup_entries - 1,
-            entries_lba: 2,
-            disk_guid: guid_from_name(disk_name),
-        },
-        &entries,
-    )?;
-    bytes[2 * SECTOR as usize..2 * SECTOR as usize + entries.len()].copy_from_slice(&entries);
-    write_header(
-        &mut bytes,
-        HeaderLoc {
-            current: backup_header,
-            backup: 1,
-            first_usable: 2048,
-            last_usable: backup_entries - 1,
-            entries_lba: backup_entries,
-            disk_guid: guid_from_name(disk_name),
-        },
-        &entries,
-    )?;
-    let backup_off = (backup_entries * SECTOR) as usize;
-    bytes[backup_off..backup_off + entries.len()].copy_from_slice(&entries);
+
+    let mut file = tempfile::tempfile()?;
+    file.set_len(total * SECTOR)?;
+    let disk_guid = Guid(guid_from_name(disk_name));
+    gpt::write_gpt(&file, total, disk_guid, &entries)
+        .map_err(|e| Error::message(format!("write_gpt: {e}")))?;
+
     for (spec, place) in parts.iter().zip(placed.iter()) {
-        let off = (place.start_lba * SECTOR) as usize;
         let room = ((place.end_lba - place.start_lba + 1) * SECTOR) as usize;
         let n = spec.payload.len().min(room);
         if n > 0 {
-            bytes[off..off + n].copy_from_slice(&spec.payload[..n]);
+            file.seek(SeekFrom::Start(place.start_lba * SECTOR))?;
+            file.write_all(&spec.payload[..n])?;
         }
     }
     if corrupt {
-        bytes[SECTOR as usize] = b'X';
-        let backup_header_off = (backup_header * SECTOR) as usize;
-        bytes[backup_header_off] = b'X';
+        file.seek(SeekFrom::Start(SECTOR))?;
+        file.write_all(b"X")?;
+        file.seek(SeekFrom::Start(backup_header * SECTOR))?;
+        file.write_all(b"X")?;
     }
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::with_capacity((total * SECTOR) as usize);
+    file.read_to_end(&mut bytes)?;
     Ok(BuiltDisk {
         bytes,
         partitions: placed,
     })
 }
 
-struct HeaderLoc {
-    current: u64,
-    backup: u64,
-    first_usable: u64,
-    last_usable: u64,
-    entries_lba: u64,
-    disk_guid: [u8; 16],
-}
-
-fn write_header(disk: &mut [u8], loc: HeaderLoc, entries: &[u8]) -> Result<()> {
-    let mut header = [0u8; 92];
-    header[0..8].copy_from_slice(b"EFI PART");
-    header[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
-    header[12..16].copy_from_slice(&92u32.to_le_bytes());
-    header[24..32].copy_from_slice(&loc.current.to_le_bytes());
-    header[32..40].copy_from_slice(&loc.backup.to_le_bytes());
-    header[40..48].copy_from_slice(&loc.first_usable.to_le_bytes());
-    header[48..56].copy_from_slice(&loc.last_usable.to_le_bytes());
-    header[56..72].copy_from_slice(&loc.disk_guid);
-    header[72..80].copy_from_slice(&loc.entries_lba.to_le_bytes());
-    header[80..84].copy_from_slice(&(ENTRY_COUNT as u32).to_le_bytes());
-    header[84..88].copy_from_slice(&(ENTRY_SIZE as u32).to_le_bytes());
-    let crc = crc32fast::hash(entries);
-    header[88..92].copy_from_slice(&crc.to_le_bytes());
-    let header_crc = crc32fast::hash(&header);
-    header[16..20].copy_from_slice(&header_crc.to_le_bytes());
-    let off = (loc.current * SECTOR) as usize;
-    if off + header.len() > disk.len() {
-        return Err(Error::message("gpt header does not fit"));
-    }
-    disk[off..off + header.len()].copy_from_slice(&header);
-    Ok(())
-}
-
-fn entry_bytes(parts: &[PlacedPartition], disk_name: &str) -> Result<Vec<u8>> {
-    let mut entries = vec![0u8; ENTRY_COUNT * ENTRY_SIZE];
-    for (index, part) in parts.iter().enumerate() {
-        if index >= ENTRY_COUNT {
-            return Err(Error::message("too many partitions"));
-        }
-        let off = index * ENTRY_SIZE;
-        entries[off..off + 16].copy_from_slice(&part.type_guid);
-        let unique = guid_from_name(&format!("{disk_name}:{}", part.name));
-        entries[off + 16..off + 32].copy_from_slice(&unique);
-        entries[off + 32..off + 40].copy_from_slice(&part.start_lba.to_le_bytes());
-        entries[off + 40..off + 48].copy_from_slice(&part.end_lba.to_le_bytes());
-        let mut name = [0u8; 72];
-        for (i, ch) in part.name.encode_utf16().take(35).enumerate() {
-            name[i * 2..i * 2 + 2].copy_from_slice(&ch.to_le_bytes());
-        }
-        entries[off + 56..off + 128].copy_from_slice(&name);
-    }
-    Ok(entries)
-}
-
-fn write_protective_mbr(disk: &mut [u8], total_sectors: u64) {
-    let size =
-        u32::try_from(total_sectors.saturating_sub(1).min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
-    disk[446] = 0x00;
-    disk[450] = 0xEE;
-    disk[454..458].copy_from_slice(&1u32.to_le_bytes());
-    disk[458..462].copy_from_slice(&size.to_le_bytes());
-    disk[510] = 0x55;
-    disk[511] = 0xAA;
-}
-
 pub fn validate_gpt(disk: &[u8]) -> Result<Vec<PlacedPartition>> {
-    if disk.len() < 2 * SECTOR as usize {
-        return Err(Error::message("disk is smaller than a GPT header"));
-    }
-    let header = &disk[SECTOR as usize..SECTOR as usize + 92];
-    if &header[0..8] != b"EFI PART" {
-        return Err(Error::message("gpt signature is invalid"));
-    }
-    let mut zeroed = [0u8; 92];
-    zeroed.copy_from_slice(header);
-    zeroed[16..20].fill(0);
-    let expect = u32::from_le_bytes(header[16..20].try_into().unwrap());
-    if crc32fast::hash(&zeroed) != expect {
-        return Err(Error::message("gpt header crc mismatch"));
-    }
-    let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
-    let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
-    let size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
-    let off = (entries_lba * SECTOR) as usize;
-    let bytes = count.saturating_mul(size);
-    if off + bytes > disk.len() {
-        return Err(Error::message("gpt entries do not fit"));
-    }
-    let entries = &disk[off..off + bytes];
-    let expect_entries = u32::from_le_bytes(header[88..92].try_into().unwrap());
-    if crc32fast::hash(entries) != expect_entries {
-        return Err(Error::message("gpt entry crc mismatch"));
-    }
-    let mut out = Vec::new();
-    for index in 0..count {
-        let e = &entries[index * size..(index + 1) * size];
-        if e[0..16].iter().all(|b| *b == 0) {
-            continue;
-        }
-        let start = u64::from_le_bytes(e[32..40].try_into().unwrap());
-        let end = u64::from_le_bytes(e[40..48].try_into().unwrap());
-        let name = decode_name(&e[56..128]);
-        out.push(PlacedPartition {
-            name,
-            type_guid: e[0..16].try_into().unwrap(),
-            start_lba: start,
-            end_lba: end,
-        });
-    }
-    Ok(out)
+    let mut file = tempfile::tempfile()?;
+    file.write_all(disk)?;
+    read_placed(&file, disk.len() as u64, "sbm-lab")
 }
 
-fn decode_name(raw: &[u8]) -> String {
-    let mut units = Vec::new();
-    for chunk in raw.chunks(2) {
-        if chunk.len() < 2 {
-            break;
-        }
-        let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
-        if unit == 0 {
-            break;
-        }
-        units.push(unit);
-    }
-    String::from_utf16_lossy(&units)
+pub fn validate_gpt_file(path: &Path) -> Result<Vec<PlacedPartition>> {
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+    read_placed(&file, size, &path.display().to_string())
+}
+
+fn read_placed(file: &File, size: u64, what: &str) -> Result<Vec<PlacedPartition>> {
+    let table =
+        gpt::read_gpt_strict(file, size, what).map_err(|e| Error::message(format!("gpt: {e}")))?;
+    Ok(table
+        .partitions
+        .into_iter()
+        .map(|p| PlacedPartition {
+            name: p.name,
+            type_guid: p.type_guid.0,
+            start_lba: p.first_lba,
+            end_lba: p.last_lba,
+        })
+        .collect())
 }
 
 #[cfg(test)]

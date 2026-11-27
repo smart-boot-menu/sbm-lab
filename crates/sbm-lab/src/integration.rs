@@ -15,9 +15,9 @@
 
 use crate::accel::{Accel, AccelRequest, Arch, HostFacts, effective_timeout, select_accel};
 use crate::error::{Error, Result};
-use crate::fatimg::{build_fat32, read_fat_file};
+use crate::fatimg::{build_fat32, read_fat_file_from_path};
 use crate::firmware::{copy_vars, select_firmware};
-use crate::gpt::{PartitionSpec, SECTOR, build_gpt, esp_guid, validate_gpt};
+use crate::gpt::{PartitionSpec, SECTOR, build_gpt, esp_guid, validate_gpt_file};
 use crate::host::host_facts;
 use crate::launch::{AttachedDisk, LaunchPlan, qemu_args};
 use crate::markers::parse_markers;
@@ -669,13 +669,7 @@ fn inspect_overlay_esp(
     overlay: &Path,
     run_dir: &Path,
 ) -> Result<(Option<Value>, bool, bool)> {
-    // Read GPT header + entries from the first 1 MiB of the base raw image.
-    let mut header = vec![0u8; 1024 * 1024];
-    {
-        let mut f = File::open(base_image)?;
-        f.read_exact(&mut header)?;
-    }
-    let parts = validate_gpt(&header)?;
+    let parts = validate_gpt_file(base_image)?;
     let esp = parts
         .iter()
         .find(|p| p.type_guid == esp_guid())
@@ -699,31 +693,32 @@ fn inspect_overlay_esp(
     if !status.success() {
         return Err(Error::message("qemu-img dd failed extracting overlay ESP"));
     }
-    let bytes = fs::read(&esp_out)?;
     let state_dir = run_dir.join("esp-state");
     fs::create_dir_all(&state_dir)?;
 
-    let last_attempt = match read_fat_file(&bytes, "EFI/sbm/state/last_attempt.json") {
+    let last_attempt = match read_fat_file_from_path(&esp_out, "EFI/sbm/state/last_attempt.json") {
         Ok(raw) => {
             let _ = fs::write(state_dir.join("last_attempt.json"), &raw);
             serde_json::from_slice::<Value>(&raw).ok()
         }
         Err(_) => None,
     };
-    let current_handoff_present = match read_fat_file(&bytes, "EFI/sbm/handoff/current.json") {
-        Ok(raw) => {
-            let _ = fs::write(state_dir.join("current.json"), &raw);
-            true
-        }
-        Err(_) => false,
-    };
-    let boot_success_consumed = match read_fat_file(&bytes, "EFI/sbm/state/boot-success.json") {
-        Ok(raw) => {
-            let _ = fs::write(state_dir.join("boot-success.json"), &raw);
-            false
-        }
-        Err(_) => true,
-    };
+    let current_handoff_present =
+        match read_fat_file_from_path(&esp_out, "EFI/sbm/handoff/current.json") {
+            Ok(raw) => {
+                let _ = fs::write(state_dir.join("current.json"), &raw);
+                true
+            }
+            Err(_) => false,
+        };
+    let boot_success_consumed =
+        match read_fat_file_from_path(&esp_out, "EFI/sbm/state/boot-success.json") {
+            Ok(raw) => {
+                let _ = fs::write(state_dir.join("boot-success.json"), &raw);
+                false
+            }
+            Err(_) => true,
+        };
     Ok((last_attempt, current_handoff_present, boot_success_consumed))
 }
 
