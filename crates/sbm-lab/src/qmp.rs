@@ -3,17 +3,22 @@ use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::thread;
 use std::time::Duration;
 
 pub struct Qmp {
     stream: UnixStream,
+    events: Vec<Value>,
 }
 
 impl Qmp {
     pub fn connect(path: &Path) -> Result<Self> {
         let stream = UnixStream::connect(path)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut qmp = Self { stream };
+        let mut qmp = Self {
+            stream,
+            events: Vec::new(),
+        };
         let _greeting = qmp.read_message()?;
         qmp.execute("qmp_capabilities", None)?;
         Ok(qmp)
@@ -29,6 +34,10 @@ impl Qmp {
         self.stream.flush()?;
         loop {
             let value = self.read_message()?;
+            if value.get("event").is_some() {
+                self.events.push(value);
+                continue;
+            }
             if value.get("return").is_some() || value.get("error").is_some() {
                 if value.get("error").is_some() {
                     return Err(Error::message(format!("qmp {command}: {value}")));
@@ -36,6 +45,32 @@ impl Qmp {
                 return Ok(value);
             }
         }
+    }
+
+    /// Poll for any queued asynchronous QMP events (such as `RESET`) without
+    /// blocking for long.
+    pub fn poll_events(&mut self) -> Vec<Value> {
+        let prev = self.stream.read_timeout().ok().flatten();
+        let _ = self
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(50)));
+        while let Ok(value) = self.read_message() {
+            if value.get("event").is_some() {
+                self.events.push(value);
+            }
+        }
+        let _ = self.stream.set_read_timeout(prev);
+        self.events.clone()
+    }
+
+    pub fn has_event(&mut self, name: &str) -> bool {
+        self.poll_events()
+            .iter()
+            .any(|ev| ev.get("event").and_then(|v| v.as_str()) == Some(name))
+    }
+
+    pub fn events(&self) -> &[Value] {
+        &self.events
     }
 
     pub fn screendump(&mut self, path: &Path) -> Result<()> {
@@ -50,10 +85,48 @@ impl Qmp {
     }
 
     pub fn send_key(&mut self, qcode: &str) -> Result<()> {
+        self.send_keys(&[qcode])
+    }
+
+    pub fn send_keys(&mut self, qcodes: &[&str]) -> Result<()> {
+        let keys: Vec<Value> = qcodes
+            .iter()
+            .map(|code| json!({ "type": "qcode", "data": code }))
+            .collect();
+        self.execute("send-key", Some(json!({ "keys": keys })))?;
+        Ok(())
+    }
+
+    /// Move the absolute USB tablet pointer to `(x, y)` in a `width x height`
+    /// framebuffer and click the left button.
+    pub fn click_abs(&mut self, x: u32, y: u32, width: u32, height: u32) -> Result<()> {
+        let ax = ((x as u64).saturating_mul(32767) / (width.max(1) as u64)).min(32767);
+        let ay = ((y as u64).saturating_mul(32767) / (height.max(1) as u64)).min(32767);
         self.execute(
-            "send-key",
+            "input-send-event",
             Some(json!({
-                "keys": [{ "type": "qcode", "data": qcode }]
+                "events": [
+                    { "type": "abs", "data": { "axis": "x", "value": ax } },
+                    { "type": "abs", "data": { "axis": "y", "value": ay } }
+                ]
+            })),
+        )?;
+        thread::sleep(Duration::from_millis(120));
+        self.execute(
+            "input-send-event",
+            Some(json!({
+                "events": [
+                    { "type": "btn", "data": { "down": true, "button": "left" } }
+                ]
+            })),
+        )?;
+        thread::sleep(Duration::from_millis(90));
+        self.execute(
+            "input-send-event",
+            Some(json!({
+                "events": [
+                    { "type": "btn", "data": { "down": false, "button": "left" } }
+                ]
             })),
         )?;
         Ok(())
@@ -112,7 +185,7 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn client_negotiates_and_skips_events() {
+    fn client_negotiates_and_records_events() {
         let dir = crate::util::test_scratch("qmp");
         let path = dir.join("qmp.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -132,7 +205,7 @@ mod tests {
             reader.read_line(&mut line).unwrap();
             writeln!(
                 writer,
-                r#"{{"event": "STOP", "data": {{}}, "timestamp": {{"seconds": 0, "microseconds": 0}}}}"#
+                r#"{{"event": "RESET", "data": {{"guest": true}}, "timestamp": {{"seconds": 1, "microseconds": 0}}}}"#
             )
             .unwrap();
             writeln!(writer, r#"{{"return": {{"status": "running"}}}}"#).unwrap();
@@ -140,6 +213,7 @@ mod tests {
         let mut qmp = Qmp::connect(&path).unwrap();
         let status = qmp.execute("query-status", None).unwrap();
         assert_eq!(status["return"]["status"], "running");
+        assert!(qmp.has_event("RESET"));
         server.join().unwrap();
     }
 }

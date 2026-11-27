@@ -5,6 +5,7 @@ use crate::bench::{class_note, methodology_complete, summarize};
 use crate::error::{Error, Result};
 use crate::fixtures::fixture_ids;
 use crate::host::doctor;
+use crate::integration::{IntegrationOptions, run_integration};
 use crate::product::{find_core_uki, find_menu};
 use crate::profile::{
     BootKind, NetworkMode, ScenarioMode, Tier, find_profile, load_profiles, load_scenarios,
@@ -117,6 +118,21 @@ enum CommandKind {
         id: Option<String>,
         #[arg(long)]
         efi: Option<PathBuf>,
+        /// Dual-architecture SBM raw image for `--tier integration`.
+        #[arg(long)]
+        image: Option<PathBuf>,
+        /// Architecture(s) for `--tier integration`: aarch64, x86_64, or both.
+        #[arg(long, default_value = "both")]
+        arch: String,
+        /// Guest memory in MiB for `--tier integration`.
+        #[arg(long, default_value_t = 4096)]
+        memory: u32,
+        /// Copy integration evidence (screenshots, serial, result.json) into this directory.
+        #[arg(long)]
+        artifacts_dir: Option<PathBuf>,
+        /// Keep disposable overlays after a passing integration run.
+        #[arg(long)]
+        keep: bool,
         #[arg(long, default_value_t = 180)]
         timeout: u64,
     },
@@ -386,8 +402,30 @@ pub fn execute() -> Result<i32> {
             tier,
             id,
             efi,
+            image,
+            arch,
+            memory,
+            artifacts_dir,
+            keep,
             timeout,
-        } => run_tier(&root, &tier, id.as_deref(), efi, timeout, cli.json),
+        } => {
+            if tier == "integration" {
+                let img = image
+                    .ok_or_else(|| Error::message("--tier integration requires --image PATH"))?;
+                run_integration_tier(
+                    &root,
+                    &img,
+                    &arch,
+                    memory,
+                    timeout.max(300),
+                    artifacts_dir,
+                    keep,
+                    cli.json,
+                )
+            } else {
+                run_tier(&root, &tier, id.as_deref(), efi, timeout, cli.json)
+            }
+        }
         CommandKind::Benchmark {
             profile,
             runs,
@@ -470,6 +508,51 @@ pub fn execute() -> Result<i32> {
             }
         },
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_integration_tier(
+    root: &Path,
+    image: &Path,
+    arch_arg: &str,
+    memory_mib: u32,
+    timeout_secs: u64,
+    artifacts_dir: Option<PathBuf>,
+    keep: bool,
+    json_out: bool,
+) -> Result<i32> {
+    let arches = match arch_arg {
+        "aarch64" | "arm64" => vec![Arch::Aarch64],
+        "x86_64" | "x86-64" => vec![Arch::X86_64],
+        "both" => vec![Arch::Aarch64, Arch::X86_64],
+        other => {
+            return Err(Error::message(format!(
+                "unknown integration arch {other}; use aarch64, x86_64, or both"
+            )));
+        }
+    };
+    let mut reports = Vec::new();
+    let mut failed = 0;
+    for arch in arches {
+        let report = run_integration(
+            root,
+            &IntegrationOptions {
+                image: image.to_path_buf(),
+                arch,
+                memory_mib,
+                cpus: 2,
+                timeout_secs,
+                artifacts_dir: artifacts_dir.clone(),
+                keep,
+            },
+        )?;
+        if !report.success {
+            failed += 1;
+        }
+        reports.push(report);
+    }
+    emit(json_out, &reports, &serde_json::to_string_pretty(&reports)?)?;
+    Ok(if failed == 0 { 0 } else { 1 })
 }
 
 fn run_tier(

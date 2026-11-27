@@ -9,6 +9,7 @@ pub mod firmware;
 pub mod fixtures;
 pub mod gpt;
 pub mod host;
+pub mod integration;
 pub mod launch;
 pub mod markers;
 pub mod product;

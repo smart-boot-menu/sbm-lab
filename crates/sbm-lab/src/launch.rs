@@ -11,6 +11,7 @@ pub struct AttachedDisk {
     pub format: String,
     pub bootindex: u32,
     pub blkdebug: Option<PathBuf>,
+    pub serial: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +92,7 @@ pub fn qemu_args(plan: &LaunchPlan) -> Result<Vec<String>> {
             args.push("-vga".into());
             args.push("none".into());
             args.push("-device".into());
-            args.push("virtio-vga".into());
+            args.push("virtio-vga,xres=1280,yres=800".into());
         }
         (Arch::X86_64 | Arch::Ia32, GpuKind::Software) => {
             args.push("-device".into());
@@ -99,7 +100,7 @@ pub fn qemu_args(plan: &LaunchPlan) -> Result<Vec<String>> {
         }
         (Arch::Aarch64, GpuKind::Virtio) => {
             args.push("-device".into());
-            args.push("virtio-gpu-pci".into());
+            args.push("virtio-gpu-pci,xres=1280,yres=800".into());
         }
         (Arch::Aarch64, GpuKind::Software) => {
             args.push("-device".into());
@@ -216,17 +217,21 @@ fn push_disk(args: &mut Vec<String>, disk: &AttachedDisk, usb: bool) -> Result<(
         disk.id, disk.format, file
     ));
     args.push("-device".into());
-    if usb {
-        args.push(format!(
+    let mut spec = if usb {
+        format!(
             "usb-storage,bus=xhci.0,drive={},removable=on,bootindex={}",
             disk.id, disk.bootindex
-        ));
+        )
     } else {
-        args.push(format!(
+        format!(
             "virtio-blk-pci,drive={},bootindex={}",
             disk.id, disk.bootindex
-        ));
+        )
+    };
+    if let Some(serial) = &disk.serial {
+        spec.push_str(&format!(",serial={serial}"));
     }
+    args.push(spec);
     Ok(())
 }
 
@@ -299,6 +304,22 @@ mod tests {
     }
 
     #[test]
+    fn virtio_gpu_sets_1280x800_resolution() {
+        let mut p = plan(Arch::Aarch64, Accel::Hvf);
+        p.gpu = GpuKind::Virtio;
+        let args = qemu_args(&p).unwrap();
+        assert!(
+            args.iter()
+                .any(|a| a == "virtio-gpu-pci,xres=1280,yres=800")
+        );
+
+        let mut x = plan(Arch::X86_64, Accel::Tcg);
+        x.gpu = GpuKind::Virtio;
+        let args = qemu_args(&x).unwrap();
+        assert!(args.iter().any(|a| a == "virtio-vga,xres=1280,yres=800"));
+    }
+
+    #[test]
     fn host_device_disk_is_rejected() {
         let mut p = plan(Arch::X86_64, Accel::Tcg);
         p.disks.push(AttachedDisk {
@@ -307,6 +328,7 @@ mod tests {
             format: "raw".into(),
             bootindex: 0,
             blkdebug: None,
+            serial: None,
         });
         assert!(qemu_args(&p).is_err());
     }

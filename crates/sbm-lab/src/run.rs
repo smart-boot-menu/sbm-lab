@@ -225,6 +225,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
             format: "qcow2".into(),
             bootindex: 0,
             blkdebug: None,
+            serial: None,
         });
         let seed = run_dir.join("cidata.raw");
         fs::write(&seed, cloud_seed()?)?;
@@ -234,6 +235,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
             format: "raw".into(),
             bootindex: 1,
             blkdebug: None,
+            serial: None,
         });
     } else if opts.inject_probe
         && opts.profile.id != "legacy-bios"
@@ -253,6 +255,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
                     format: "raw".into(),
                     bootindex: 2,
                     blkdebug: None,
+                    serial: None,
                 });
             }
             path
@@ -265,6 +268,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
             format: "raw".into(),
             bootindex: 0,
             blkdebug: None,
+            serial: None,
         });
     }
     let fixture_names = if let Some(name) = &opts.fixture {
@@ -295,6 +299,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
             format,
             bootindex: (index as u32) + 1,
             blkdebug,
+            serial: None,
         };
         if opts.profile.usb && index + 1 == fixture_names.len() {
             usb_disks.push(attached);
@@ -314,6 +319,7 @@ pub fn execute_run(root: &Path, opts: &RunOptions) -> Result<RunReport> {
             },
             bootindex: 10 + index as u32,
             blkdebug: None,
+            serial: None,
         });
     }
     let serial_log = run_dir.join("serial-qemu.log");
