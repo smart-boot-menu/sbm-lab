@@ -1643,20 +1643,15 @@ mod tests {
     #[test]
     fn refuses_the_second_slice_of_the_same_budget() {
         let dir = test_scratch("budget");
-        let view = quiet(16384);
-        let rules = policy();
-        let budget = guest_budget_mib(
-            view.total_mib,
-            view.pressure,
-            view.swap_used_mib,
-            view.swap_total_mib,
-        );
-        let first_mib = (budget - 1024) as u32;
-        let first_wl = if cfg!(target_os = "macos") {
-            Workload::Build
+        let (view, first_mib) = if cfg!(target_os = "macos") {
+            // 16 GiB Mac: guest budget 5120 MiB -> 4096 + 2048 exceeds budget.
+            (quiet(16384), 4096)
         } else {
-            Workload::Ram
+            // 14 GiB Linux: guest budget 7168 MiB -> 6144 + 2048 exceeds budget.
+            (quiet(14336), 6144)
         };
+        let rules = policy();
+        let first_wl = Workload::Build;
         try_admit(&dir, &view, &rules, &request(first_wl, first_mib)).unwrap();
         let err = try_admit(&dir, &view, &rules, &request(Workload::Linux, 2048)).unwrap_err();
         assert!(err.to_string().contains("budget"), "{err}");
