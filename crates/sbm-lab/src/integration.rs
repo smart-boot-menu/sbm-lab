@@ -1795,7 +1795,7 @@ fn find_colored_buttons(
                 if run_end - run_start >= 30 {
                     if let Some(b) = boxes
                         .iter_mut()
-                        .find(|b| run_start <= b.2 + 8 && run_end + 8 >= b.0 && y <= b.3 + 4)
+                        .find(|b| run_start <= b.2 + 4 && run_end + 4 >= b.0 && y <= b.3 + 16)
                     {
                         b.0 = b.0.min(run_start);
                         b.1 = b.1.min(y);
