@@ -87,7 +87,8 @@ jobs:
               "QEMUCPU": sys.argv[2],
               "QEMUCPUS": 2,
               "QEMURAM": 512,
-              "NICTYPE": "none",
+              "NICTYPE": "user",
+              "NICTYPE_USER_OPTIONS": "restrict=on",
               "SERIALDEV": "ttyS0",
               "HDDSIZEGB": 1,
           }, indent=2))

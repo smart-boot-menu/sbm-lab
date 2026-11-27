@@ -6,7 +6,7 @@ This directory prototypes [`os-autoinst`](https://github.com/os-autoinst/os-auto
 
 - **Experimental prototype only.** All existing `sbm-lab` tiers (`smoke`, `product`, `secure`, `integration`) remain preserved and authoritative until `os-autoinst` demonstrates equivalent or better coverage, reliability, and maintainability.
 - **No full Linux image builds.** The prototype boots the tiny `fixtures/efi-probe` UEFI binary on a disposable 48 MiB GPT + FAT32 disk image under OVMF/KVM, asserts `SBM-LAB-MARKER:*` serial milestones via `wait_serial`, and captures a framebuffer screenshot via `save_screenshot`.
-- **Offline by default.** `NICTYPE=none` ensures the guest boots with no virtual network interface.
+- **Offline by default.** `NICTYPE=user` with `NICTYPE_USER_OPTIONS=restrict=on` isolates the guest offline (QEMU user-net restricted mode).
 
 ## Layout
 
