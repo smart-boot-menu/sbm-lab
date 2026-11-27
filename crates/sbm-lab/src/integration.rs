@@ -568,7 +568,7 @@ pub fn run_integration_negative(
 }
 
 fn run_one_negative(root: &Path, opts: &NegativeOptions, scenario: &str) -> Result<NegativeReport> {
-    let id = format!("neg-{}-{}-{}", opts.arch, scenario, short_id());
+    let id = format!("n-{}", short_id());
     let run_dir = root.join("var/runs").join(&id);
     fs::create_dir_all(&run_dir)?;
 
@@ -884,6 +884,7 @@ fn run_one_negative(root: &Path, opts: &NegativeOptions, scenario: &str) -> Resu
         scenario,
         is_tcg,
         &mut child,
+        &run_dir,
         &serial_log,
         &qmp_sock,
         deadline,
@@ -1067,7 +1068,13 @@ fn run_one_negative(root: &Path, opts: &NegativeOptions, scenario: &str) -> Resu
     if let Some(dir) = &opts.artifacts_dir {
         let dest = dir.join(format!("neg-{}-{scenario}-{id}", opts.arch));
         fs::create_dir_all(&dest)?;
-        for name in ["result.json", "serial.log", "qemu.stderr", "qemu.argv"] {
+        for name in [
+            "result.json",
+            "serial.log",
+            "qemu.stderr",
+            "qemu.argv",
+            "refusal.ppm",
+        ] {
             let src = run_dir.join(name);
             if src.is_file() {
                 let _ = fs::copy(&src, dest.join(name));
@@ -1088,11 +1095,12 @@ fn drive_negative(
     scenario: &str,
     is_tcg: bool,
     child: &mut Child,
+    run_dir: &Path,
     serial_log: &Path,
     qmp_sock: &Path,
     deadline: Instant,
 ) -> Result<()> {
-    let mut serial = wait_open(serial_log, deadline)?;
+    let mut serial = wait_open_child(child, serial_log, deadline)?;
     let mut qmp = wait_qmp(qmp_sock, deadline)?;
     let mut buf = String::new();
 
@@ -1107,6 +1115,7 @@ fn drive_negative(
                 parse_markers(text).iter().any(|m| m.name == "verify_done")
             })?;
             thread::sleep(Duration::from_secs(2));
+            let _ = qmp.screendump(&run_dir.join("refusal.ppm"));
         }
         "corrupt-verity" => {
             wait_until(child, &mut serial, &mut buf, deadline, |text| {
@@ -1140,6 +1149,7 @@ fn drive_negative(
                 parse_markers(text).iter().any(|m| m.name == "menu_ready")
             })?;
             thread::sleep(Duration::from_millis(800));
+            let _ = qmp.screendump(&run_dir.join("refusal.ppm"));
         }
         "local-boot-request-positive" => {
             wait_until(child, &mut serial, &mut buf, deadline, |text| {
@@ -1430,6 +1440,27 @@ fn capture(qmp: &mut Qmp, run_dir: &Path, name: &str, state: &mut FlowState) -> 
         .screenshots
         .insert(name.to_string(), path.display().to_string());
     Ok(path)
+}
+
+fn wait_open_child(child: &mut Child, path: &Path, deadline: Instant) -> Result<File> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(Error::message(format!(
+                "qemu exited ({status}) before creating {}",
+                path.display()
+            )));
+        }
+        if Instant::now() > deadline {
+            return Err(Error::message(format!(
+                "timed out waiting for {}",
+                path.display()
+            )));
+        }
+        if let Ok(file) = File::open(path) {
+            return Ok(file);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_open(path: &Path, deadline: Instant) -> Result<File> {
