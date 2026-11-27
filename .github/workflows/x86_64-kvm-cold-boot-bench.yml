@@ -159,7 +159,7 @@ jobs:
                   "-accel", "kvm",
                   "-cpu", "qemu64",
                   "-m", "1024",
-                  "-smp", "1",
+                  "-smp", "11",
                   "-display", "none",
                   "-nodefaults",
                   "-vga", "none",
@@ -173,7 +173,7 @@ jobs:
                   "-device", "usb-kbd,bus=xhci.0",
                   "-device", "usb-tablet,bus=xhci.0",
                   "-drive", f"if=none,id=sbmusb,format=qcow2,file={overlay}",
-                  "-device", "usb-storage,bus=xhci.0,drive=sbmusb,removable=on,bootindex=0",
+                  "-device", "virtio-blk-pci,drive=sbmusb,bootindex=0",
               ]
               if first_run_argv is None:
                   first_run_argv = argv[1:]
@@ -265,7 +265,7 @@ jobs:
               "accel": "kvm",
               "execution_class": "accelerated_virtualization",
               "representative_of_physical_hardware": False,
-              "execution_note": "Hosted GitHub Actions ubuntu-latest native x86-64 KVM virtualization on the exact frozen assembled sbm-0.0.1-uefi-x86_64.raw image. Not a physical-hardware measurement.",
+              "execution_note": "Hosted GitHub Actions ubuntu-latest native x86-64 KVM virtualization on the exact frozen assembled sbm-0.0.1-uefi-x86_64.raw image (virtio-blk-pci CoW overlay). Not a physical-hardware measurement.",
               "image": raw_name,
               "image_size_bytes": raw_size,
               "image_sha256": expected_raw,
@@ -275,6 +275,7 @@ jobs:
               "offline_no_nic": True,
               "resolution": "1280x800",
               "gpu": "virtio-vga",
+              "disk_bus": "virtio-blk-pci",
               "ovmf_code": ovmf_code,
               "ovmf_vars_template": ovmf_vars,
               "qemu_version": qemu_ver,
