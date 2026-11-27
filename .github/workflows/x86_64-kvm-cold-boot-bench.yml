@@ -159,7 +159,7 @@ jobs:
                   "-accel", "kvm",
                   "-cpu", "qemu64",
                   "-m", "1024",
-                  "-smp", "11",
+                  "-smp", "1",
                   "-display", "none",
                   "-nodefaults",
                   "-vga", "none",
