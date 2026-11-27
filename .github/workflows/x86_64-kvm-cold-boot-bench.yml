@@ -1,0 +1,326 @@
+name: x86-64 KVM Cold-Boot Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: "Numeric ID of an unpublished draft release in this repo holding the frozen .raw.zst"
+        required: true
+        type: string
+      asset_name:
+        description: "Asset filename inside the draft release"
+        required: true
+        default: "sbm-0.0.1-uefi-x86_64.raw.zst"
+        type: string
+      expected_zst_sha256:
+        description: "Expected SHA-256 of the compressed .raw.zst image"
+        required: true
+        type: string
+      expected_raw_sha256:
+        description: "Expected SHA-256 of the decompressed .raw image"
+        required: true
+        type: string
+      runs:
+        description: "Number of cold-boot runs (must be >= 10)"
+        required: true
+        default: "10"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  kvm-cold-boot-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Verify native KVM access
+        run: |
+          test -c /dev/kvm
+          sudo chgrp "$(id -gn)" /dev/kvm
+          sudo chmod g+rw /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          lscpu | head -n 20 || true
+
+      - name: Install QEMU, OVMF, zstd, and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils ovmf zstd jq
+          qemu-system-x86_64 --version
+          ls -l /usr/share/OVMF/
+
+      - name: Download and verify frozen x86-64 image from unpublished draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          EXPECTED_ZST_SHA256: ${{ inputs.expected_zst_sha256 }}
+          EXPECTED_RAW_SHA256: ${{ inputs.expected_raw_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p work out
+          meta="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+          is_draft="$(printf '%s' "$meta" | jq -r '.draft')"
+          if [ "$is_draft" != "true" ]; then
+            echo "Refusing non-draft release ${RELEASE_ID}" >&2
+            exit 1
+          fi
+          asset_id="$(printf '%s' "$meta" | jq -er --arg n "$ASSET_NAME" '.assets[] | select(.name == $n) | .id')"
+          curl -fSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            -o "work/${ASSET_NAME}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+
+          actual_zst="$(sha256sum "work/${ASSET_NAME}" | awk '{print $1}')"
+          echo "zst sha256: ${actual_zst}"
+          if [ "$actual_zst" != "$EXPECTED_ZST_SHA256" ]; then
+            echo "ZST SHA-256 mismatch: expected ${EXPECTED_ZST_SHA256}, got ${actual_zst}" >&2
+            exit 1
+          fi
+
+          raw_path="work/${ASSET_NAME%.zst}"
+          zstd -d -f "work/${ASSET_NAME}" -o "$raw_path"
+          actual_raw="$(sha256sum "$raw_path" | awk '{print $1}')"
+          raw_size="$(stat -c%s "$raw_path")"
+          echo "raw sha256: ${actual_raw} (${raw_size} bytes)"
+          if [ "$actual_raw" != "$EXPECTED_RAW_SHA256" ]; then
+            echo "RAW SHA-256 mismatch: expected ${EXPECTED_RAW_SHA256}, got ${actual_raw}" >&2
+            exit 1
+          fi
+
+      - name: Run N >= 10 native KVM cold boots on verified frozen image
+        env:
+          ASSET_NAME: ${{ inputs.asset_name }}
+          EXPECTED_ZST_SHA256: ${{ inputs.expected_zst_sha256 }}
+          EXPECTED_RAW_SHA256: ${{ inputs.expected_raw_sha256 }}
+          RUNS: ${{ inputs.runs }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, shutil, statistics, subprocess, sys, time
+
+          runs = int(os.environ["RUNS"])
+          if runs < 10:
+              raise SystemExit(f"runs must be >= 10, got {runs}")
+
+          asset_name = os.environ["ASSET_NAME"]
+          raw_name = asset_name[:-4] if asset_name.endswith(".zst") else asset_name
+          raw_path = os.path.abspath(os.path.join("work", raw_name))
+          expected_raw = os.environ["EXPECTED_RAW_SHA256"]
+          expected_zst = os.environ["EXPECTED_ZST_SHA256"]
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          ovmf_code = "/usr/share/OVMF/OVMF_CODE_4M.fd"
+          ovmf_vars = "/usr/share/OVMF/OVMF_VARS_4M.fd"
+          if not os.path.exists(ovmf_vars):
+              ovmf_vars = "/usr/share/OVMF/OVMF_VARS.fd"
+          assert os.path.exists(ovmf_code), f"missing {ovmf_code}"
+          assert os.path.exists(ovmf_vars), f"missing {ovmf_vars}"
+
+          qemu_ver = subprocess.check_output(["qemu-system-x86_64", "--version"], text=True).splitlines()[0]
+          cpu_model = ""
+          try:
+              for line in subprocess.check_output(["lscpu"], text=True).splitlines():
+                  if line.startswith("Model name:"):
+                      cpu_model = line.split(":", 1)[1].strip()
+                      break
+          except Exception:
+              pass
+
+          before_hash = sha256_file(raw_path)
+          assert before_hash == expected_raw, f"pre-bench hash mismatch: {before_hash}"
+          raw_size = os.path.getsize(raw_path)
+
+          samples = []
+          first_run_argv = None
+
+          for i in range(1, runs + 1):
+              rdir = os.path.abspath(os.path.join("work", f"run-{i:02d}"))
+              os.makedirs(rdir, exist_ok=True)
+              overlay = os.path.join(rdir, "sbm-usb.qcow2")
+              vars_fd = os.path.join(rdir, "vars.fd")
+              serial_log = os.path.join(rdir, "serial.log")
+              debugcon_log = os.path.join(rdir, "debugcon.log")
+              stderr_log = os.path.join(rdir, "qemu.stderr")
+              shutil.copyfile(ovmf_vars, vars_fd)
+              subprocess.check_call(
+                  ["qemu-img", "create", "-q", "-f", "qcow2", "-F", "raw", "-b", raw_path, overlay]
+              )
+
+              argv = [
+                  "qemu-system-x86_64",
+                  "-machine", "q35",
+                  "-accel", "kvm",
+                  "-cpu", "qemu64",
+                  "-m", "1024",
+                  "-smp", "2",
+                  "-display", "none",
+                  "-nodefaults",
+                  "-vga", "none",
+                  "-device", "virtio-vga,xres=1280,yres=800",
+                  "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={ovmf_code}",
+                  "-drive", f"if=pflash,format=raw,unit=1,file={vars_fd}",
+                  "-serial", f"file:{serial_log}",
+                  "-chardev", f"file,id=debugcon,path={debugcon_log}",
+                  "-device", "isa-debugcon,iobase=0x402,chardev=debugcon",
+                  "-device", "qemu-xhci,id=xhci",
+                  "-device", "usb-kbd,bus=xhci.0",
+                  "-device", "usb-tablet,bus=xhci.0",
+                  "-drive", f"if=none,id=sbmusb,format=qcow2,file={overlay}",
+                  "-device", "usb-storage,bus=xhci.0,drive=sbmusb,removable=on,bootindex=0",
+              ]
+              if first_run_argv is None:
+                  first_run_argv = argv[1:]
+
+              t0 = time.monotonic()
+              with open(stderr_log, "wb") as errf:
+                  proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=errf)
+                  deadline = t0 + 45.0
+                  serial_text = ""
+                  ready = False
+                  while time.monotonic() < deadline:
+                      if os.path.exists(serial_log):
+                          with open(serial_log, "r", encoding="utf-8", errors="replace") as sf:
+                              serial_text = sf.read()
+                          if "SBM_MARK menu_ready us=" in serial_text and "SBM_MARK glyph_cache " in serial_text:
+                              ready = True
+                              break
+                      if proc.poll() is not None:
+                          break
+                      time.sleep(0.05)
+                  wall_ms = int(round((time.monotonic() - t0) * 1000))
+                  if proc.poll() is None:
+                      proc.terminate()
+                      try:
+                          proc.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          proc.kill()
+                          proc.wait(timeout=5)
+
+              if not ready:
+                  err_txt = open(stderr_log, "r", errors="replace").read()
+                  raise SystemExit(
+                      f"Run {i} failed to reach menu_ready+glyph_cache (wall_ms={wall_ms}).\n"
+                      f"STDERR:\n{err_txt}\nSERIAL:\n{serial_text}"
+                  )
+
+              def extract_int(pattern, label):
+                  m = re.search(pattern, serial_text)
+                  if not m:
+                      raise SystemExit(f"Run {i} missing {label} in serial log:\n{serial_text}")
+                  return int(m.group(1))
+
+              sample = {
+                  "run": i,
+                  "wall_ms": wall_ms,
+                  "first_frame_us": extract_int(r"SBM_MARK first_frame us=(\d+)", "first_frame_us"),
+                  "discovery_done_us": extract_int(r"SBM_MARK discovery_done us=(\d+)", "discovery_done_us"),
+                  "policy_us": extract_int(r"SBM_MARK policy [^\n]*?us=(\d+)", "policy_us"),
+                  "menu_ready_us": extract_int(r"SBM_MARK menu_ready us=(\d+)", "menu_ready_us"),
+                  "glyph_cache_glyphs": extract_int(r"SBM_MARK glyph_cache glyphs=(\d+)", "glyph_cache_glyphs"),
+                  "glyph_cache_bytes": extract_int(r"SBM_MARK glyph_cache [^\n]*?bytes=(\d+)", "glyph_cache_bytes"),
+                  "mem_delta_pages": extract_int(r"SBM_MARK mem [^\n]*?delta=(\d+)", "mem_delta_pages"),
+              }
+              m_clk = re.search(r"SBM_MARK clock hz=(\d+)", serial_text)
+              if m_clk:
+                  sample["clock_hz"] = int(m_clk.group(1))
+              m_gop = re.search(r"SBM_MARK gop (\d+x\d+)", serial_text)
+              if m_gop:
+                  sample["gop"] = m_gop.group(1)
+              samples.append(sample)
+              print(f"Run {i:02d}/{runs}: menu_ready={sample['menu_ready_us']} us ({sample['menu_ready_us']/1000:.2f} ms), first_frame={sample['first_frame_us']} us, wall={wall_ms} ms")
+
+              if i == 1:
+                  shutil.copyfile(serial_log, os.path.join("out", "sample-run1-serial.log"))
+              shutil.rmtree(rdir)
+
+          after_hash = sha256_file(raw_path)
+          inputs_unchanged = (before_hash == after_hash == expected_raw)
+          assert inputs_unchanged, f"backing image mutated! before={before_hash} after={after_hash}"
+
+          def pct(sorted_vals, p):
+              idx = int(round((p / 100.0) * (len(sorted_vals) - 1)))
+              return sorted_vals[min(idx, len(sorted_vals) - 1)]
+
+          mr = sorted(s["menu_ready_us"] for s in samples)
+          ff = sorted(s["first_frame_us"] for s in samples)
+          median_mr = int(round(statistics.median(mr)))
+          median_ff = int(round(statistics.median(ff)))
+          budget_ms = 250.0
+          passed = (len(samples) >= 10) and (median_mr < budget_ms * 1000.0) and inputs_unchanged
+
+          report = {
+              "schema": "sbm-0.0.1.cold-boot-bench.v1",
+              "arch": "x86_64",
+              "accel": "kvm",
+              "execution_class": "accelerated_virtualization",
+              "representative_of_physical_hardware": False,
+              "execution_note": "Hosted GitHub Actions ubuntu-latest native x86-64 KVM virtualization on the exact frozen assembled sbm-0.0.1-uefi-x86_64.raw image. Not a physical-hardware measurement.",
+              "image": raw_name,
+              "image_size_bytes": raw_size,
+              "image_sha256": expected_raw,
+              "compressed_image": asset_name,
+              "compressed_sha256": expected_zst,
+              "inputs_unchanged": inputs_unchanged,
+              "offline_no_nic": True,
+              "resolution": "1280x800",
+              "gpu": "virtio-vga",
+              "ovmf_code": ovmf_code,
+              "ovmf_vars_template": ovmf_vars,
+              "qemu_version": qemu_ver,
+              "runner_cpu_model": cpu_model,
+              "github_run_id": int(os.environ.get("GITHUB_RUN_ID", "0")),
+              "github_sha": os.environ.get("GITHUB_SHA", ""),
+              "qemu_argv_template": first_run_argv,
+              "n": len(samples),
+              "budget_ms": budget_ms,
+              "pass": passed,
+              "menu_ready_us": {
+                  "min": mr[0],
+                  "median": median_mr,
+                  "p95": pct(mr, 95.0),
+                  "max": mr[-1],
+                  "mean": round(sum(mr) / len(mr), 1),
+              },
+              "first_frame_us": {
+                  "min": ff[0],
+                  "median": median_ff,
+                  "p95": pct(ff, 95.0),
+                  "max": ff[-1],
+              },
+              "samples": samples,
+          }
+
+          out_path = os.path.join("out", "cold-boot-bench-x86_64-kvm.json")
+          with open(out_path, "w", encoding="utf-8") as f:
+              json.dump(report, f, indent=2)
+              f.write("\n")
+
+          print(json.dumps({
+              "n": report["n"],
+              "pass": report["pass"],
+              "menu_ready_us": report["menu_ready_us"],
+              "first_frame_us": report["first_frame_us"],
+              "inputs_unchanged": report["inputs_unchanged"],
+          }, indent=2))
+          if not passed:
+              raise SystemExit("Benchmark failed budget or methodology gate")
+          PY
+
+      - name: Clean up image files
+        if: always()
+        run: rm -rf work
+
+      - name: Upload timing results only (never disk images)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-kvm-cold-boot-bench
+          path: out/
+          retention-days: 30
