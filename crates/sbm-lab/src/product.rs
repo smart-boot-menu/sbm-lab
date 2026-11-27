@@ -99,16 +99,18 @@ fn menu_files(
         Arch::Aarch64 => ("BOOTAA64.EFI", "aa64", "aa64"),
         Arch::Ia32 => ("BOOTIA32.EFI", "ia32", "ia32"),
     };
-    let recovery_hash = sha256_bytes(recovery);
-    let fixture_hash = sha256_bytes(fixture);
-    let slot_b_hash = if recovery == fixture {
-        recovery_hash.clone()
-    } else {
-        fixture_hash
-    };
-    let manifest = format!(
-        "{{\n  \"schema_version\": \"1.0\",\n  \"active_slot\": \"slot-a\",\n  \"slots\": [\n    {{\"slot_name\": \"slot-a\", \"uki_efi_path\": \"\\\\EFI\\\\sbm\\\\recovery\\\\slot-a\\\\sbm-core.efi\", \"sha256\": \"{recovery_hash}\", \"version\": \"0.1.0-{class}\", \"healthy\": true}},\n    {{\"slot_name\": \"slot-b\", \"uki_efi_path\": \"\\\\EFI\\\\sbm\\\\recovery\\\\slot-b\\\\sbm-core.efi\", \"sha256\": \"{slot_b_hash}\", \"version\": \"0.1.0-fixture\", \"healthy\": true}}\n  ]\n}}\n"
-    );
+    let uki_path = format!("EFI/sbm/recovery/slot-a/sbm-core-{arch}.efi");
+    let manifest = serde_json::json!({
+        "schema_version": "1.0",
+        "active_slot": "slot-a",
+        "slots": [{
+            "slot_name": "slot-a",
+            "uki_efi_path": format!("\\{}", uki_path.replace('/', "\\")),
+            "sha256": sha256_bytes(recovery),
+            "version": format!("0.1.0-{class}"),
+            "healthy": true,
+        }],
+    });
     let policy = "{\n  \"schema_version\": \"1.0\",\n  \"policy_revision\": 0,\n  \"timeout_seconds\": 65535,\n  \"max_failed_attempts\": 3,\n  \"network_policy_timeout_ms\": 3000,\n  \"allow_remote_boot_select\": false,\n  \"offline_behavior\": \"use_local_policy\"\n}\n";
     let nsh = format!("echo -off\r\nfs0:\\EFI\\BOOT\\{boot}\r\n");
     let bls_conf = format!(
@@ -128,17 +130,10 @@ fn menu_files(
         ("EFI/Linux/fedora.efi".into(), fixture.to_vec()),
         ("EFI/sbm/sbm.efi".into(), fixture.to_vec()),
         ("loader/entries/fedora.conf".into(), bls_conf.into_bytes()),
-        (
-            "EFI/sbm/recovery/slot-a/sbm-core.efi".into(),
-            recovery.to_vec(),
-        ),
-        (
-            "EFI/sbm/recovery/slot-b/sbm-core.efi".into(),
-            fixture.to_vec(),
-        ),
+        (uki_path, recovery.to_vec()),
         (
             "EFI/sbm/recovery/manifest.json".into(),
-            manifest.into_bytes(),
+            manifest.to_string().into_bytes(),
         ),
         ("EFI/sbm/policy.json".into(), policy.as_bytes().to_vec()),
         (
@@ -304,7 +299,12 @@ mod tests {
             .unwrap();
         let hash = sha256_bytes(&fixture);
         assert!(manifest.contains(&hash));
-        assert!(manifest.contains("slot-a"));
+        let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        assert_eq!(manifest["slots"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            manifest["slots"][0]["uki_efi_path"],
+            r"\EFI\sbm\recovery\slot-a\sbm-core-x86_64.efi"
+        );
         assert!(files.iter().any(|(path, _)| path == "EFI/BOOT/BOOTX64.EFI"));
         assert!(files.iter().any(|(path, bytes)| {
             path == "EFI/sbm-lab/not-an-os.txt" && bytes.starts_with(b"THIS IS NOT")
